@@ -1,0 +1,50 @@
+{
+  "name": "code-waechter",
+  "version": "1.0.0",
+  "description": "Code-Wächter / Code Guard: prüft jede Datei, die Claude schreibt, sofort auf Fehler, Sicherheitslücken und Verbesserungen (C#, VB.NET, F#, C/C++, Assembler, Python, PHP, JavaScript/TypeScript, Vue, Svelte, HTML/CSS/SCSS, XML, JSON, YAML, TOML, SQL, Lua, Luau, Shell, Batch, PowerShell, Java, Kotlin, Go, Rust, Zig, Ruby, Perl, Swift, Dart, Scala, Haskell, OCaml, Elixir, Julia, R, Fortran, Pascal, Ada, Odin, Lisp, MATLAB, Solidity, Terraform, Bicep, CMake, Makefile, Nix, Shader (HLSL, GLSL, Unity, CUDA, WGSL), Verilog, VHDL, Unity, Unreal, Godot, Blender-Skripte) und zeigt alles gegliedert in der Seitenleiste. Führt nie Code aus nicht freigegebenen Ordnern aus. Checks every file Claude writes for errors, security holes and improvements, in German or English.",
+  "displayName": "Code-Wächter / Code Guard",
+  "author": { "name": "Käse_Hobel" },
+  "homepage": "https://github.com/kaesehobel79ch/code-waechter",
+  "repository": "https://github.com/kaesehobel79ch/code-waechter",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "sprache": {
+      "type": "string",
+      "title": "Sprache / Language",
+      "description": "Sprache der Meldungen: auto (Anzeigesprache von Windows), de oder en. / Message language: auto (Windows display language), de or en.",
+      "options": ["auto", "de", "en"],
+      "default": "auto"
+    },
+    "freigegebene_ordner": {
+      "type": "string",
+      "title": "Freigegebene Ordner / Trusted folders",
+      "description": "Nur hier werden Projekte übersetzt und Projekt-Prüfskripte gestartet (das kann Code des Projekts ausführen). Mehrere mit ; trennen, z. B. D:\\Projekte. Leer: nirgends, dann nur Schreibweise. / Only here are projects built and project scripts run (that can run the project's code). Separate several with ;. Empty: nowhere, syntax only.",
+      "default": ""
+    },
+    "werkzeug_ordner": {
+      "type": "directory",
+      "title": "Ordner für Prüfprogramme / Checker folder",
+      "description": "Hierhin lädt /waechter-werkzeuge die Prüfprogramme, je in einen eigenen Unterordner (ein vorhandener Ordner gleichen Namens, der nicht von der Mod stammt, wird nie angefasst). Leer: %LOCALAPPDATA%\\Code-Waechter\\Werkzeuge. / Where /waechter-werkzeuge puts the checkers, each in its own subfolder (an existing folder of the same name that the mod did not create is never touched). Empty: %LOCALAPPDATA%\\Code-Waechter\\Werkzeuge.",
+      "default": ""
+    },
+    "ablage": {
+      "type": "directory",
+      "title": "Ablage für Projektliste und Fehlerberichte / Project list and reports",
+      "description": "Ordner mit der Projektliste (Projekte.txt) und den Fehlerberichten. Leer: der Ordner Code-Waechter im Benutzerordner. / Folder for the project list and the error reports. Empty: Code-Waechter in the user folder.",
+      "default": ""
+    },
+    "python_befehl": {
+      "type": "string",
+      "title": "Python-Aufruf / Python command",
+      "description": "So wird Python gestartet, z. B. \"py\" oder \"py -3.14\". Für die gründliche Python-Prüfung muss dort pyflakes installiert sein. / How Python is started, e.g. \"py\" or \"python\". pyflakes must be installed there for the full Python check.",
+      "default": "py"
+    },
+    "sql_dialekt": {
+      "type": "string",
+      "title": "SQL-Dialekt / SQL dialect",
+      "description": "Für .sql-Dateien, z. B. tsql (SQL Server), mysql, postgres, sqlite, oracle. Leer: als Fehler gilt nur, was in keinem von tsql, mysql, postgres und sqlite gültig ist. / For .sql files, e.g. tsql, mysql, postgres, sqlite, oracle. Empty: only what is invalid in all of tsql, mysql, postgres and sqlite counts as an error.",
+      "default": ""
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "kaese-hobel",
+  "description": "Mods für Claude Code von Käse_Hobel / Claude Code mods by Käse_Hobel",
+  "owner": { "name": "Käse_Hobel" },
+  "plugins": [
+    { "name": "code-waechter", "source": "./" }
+  ]
+}
