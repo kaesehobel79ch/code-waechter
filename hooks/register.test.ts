@@ -533,6 +533,33 @@ test('prüft eine Datei, die ein Bash-Befehl mit vollem Pfad schreibt', VERTRAUT
   expect((ran.context ?? []).join('\n')).toContain('✖ «gen.py»')
 })
 
+test('bricht die Prüfung nach Edit selbst ab, meldet sie NICHT GEPRÜFT statt still nichts', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  on('clock.now', () => ({ deny: 'Uhr kaputt' }))
+  on('tool.call', () => toolAnswer as never)
+  on('fs.read', () => ({ value: '{ "a": 1 }\n' }))
+
+  const ran = await $.tool.call({ tool: 'Edit', file_path: 'D:\\t\\a.json', old_string: '1', new_string: '2' })
+  const text = (ran.context ?? []).join('\n')
+
+  expect(text).toContain('«a.json»: NICHT GEPRÜFT – interner Fehler der Prüfung')
+  expect(text).toContain('/scan')
+})
+
+test('bricht die Prüfung nach einem Befehl selbst ab, meldet sie NICHT GEPRÜFT statt still nichts', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  // Die Startzeit des Befehls geht noch, die Uhr fällt erst in der Prüfung aus.
+  let calls = 0
+  on('clock.now', () => (++calls === 1 ? { value: 1000 } : { deny: 'Uhr kaputt' }))
+  on('tool.call', () => toolAnswer as never)
+  on('fs.stat', () => ({ value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } }))
+  on('fs.read', () => ({ value: 'x = 1\n' }))
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'touch "D:/t/gen.py"' })
+
+  expect((ran.context ?? []).join('\n')).toContain('NICHT GEPRÜFT – interner Fehler der Prüfung')
+})
+
 test('lässt Bash-Befehle ohne Dateipfad in Ruhe', VERTRAUT, async ($, on) => {
   withTemp(on)
   mock.clock(on)
@@ -930,21 +957,41 @@ test('pyflakes stürzt ab oder die Datei ist weg: NICHT GEPRÜFT statt ✔', VER
   expect(text).not.toContain('✔')
 })
 
-test('zu große Dateien: offen NICHT GEPRÜFT mit Grund, die Prüfung startet gar nicht erst', VERTRAUT, async ($, on) => {
+// Große Dateien (30.10.2026: eine 34-MB-Unity-Datei blieb wegen einer festen 20-MB-Grenze ungeprüft): keine Grenze mehr. Der
+// Prüfer liest die Datei selbst; was die Mod selbst liest (über 4 MiB lehnt $.fs.read ab), liest sie in Stücken.
+test('große Dateien: keine Größengrenze, die Mod liest in Stücken und findet einen Fehler im zweiten Stück an der richtigen Zeile', VERTRAUT, async ($, on) => {
   withTemp(on)
   mock.clock(on)
   on('tool.call', () => toolAnswer as never)
-  on('fs.stat', () => ({ value: { kind: 'file' as const, size: 50 * 1024 * 1024, mtimeMs: 0, isLink: false } }))
-  let runs = 0
-  on('process.run', () => {
-    runs++
-    return { value: done }
+  on('fs.write', () => ({ value: undefined }))
+  const gross = (p: string) => p.endsWith('riesig.xml')
+  on('fs.stat', (_$, e) => ({ value: { kind: 'file' as const, size: gross(e.path) ? 50 * 1024 * 1024 : 100, mtimeMs: 0, isLink: false } }))
+  const stuecke: Record<string, string> = { _0: '<a>\n<b/>\n', _1: '<<<<<<< HEAD\n<c/>\n=======\n>>>>>>> zweig\n</a>\n' }
+  on('fs.read', (_$, e) => {
+    const m = /grossdatei_\d+(_\d+)\.txt$/.exec(e.path)
+    return m ? { value: stuecke[m[1]] } : gross(e.path) ? { deny: 'über 4 MiB' } : { value: '' }
+  })
+  let pruefer = 0
+  let teilen = 0
+  on('process.run', (_$, e) => {
+    const skript = e.argv.join(' ')
+    if (skript.includes('STUECKE')) {
+      teilen++
+      return { value: { ...done, stdout: 'STUECKE:2\r\n' } }
+    }
+    if (e.argv[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (!skript.includes('Remove-Item')) pruefer++
+    return { value: { ...done, stdout: 'CODE-WAECHTER-GEPRUEFT\n' } }
   })
 
-  const ran = await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\riesig.xml', content: 'x' })
+  const text = await write($, 'D:\\t\\riesig.xml')
 
-  expect((ran.context ?? []).join('\n')).toContain('zu groß')
-  expect(runs).toBe(0)
+  expect(text).not.toContain('zu groß')
+  expect(pruefer).toBeGreaterThan(0)
+  expect(text).toContain('✖ «riesig.xml»')
+  expect(text).toContain('Zeile 3')
+  expect(text).toContain('Konfliktmarke')
+  expect(teilen).toBe(1)
 })
 
 test('weitere Dateiarten (vcxproj, svg, xsd) werden als XML geprüft', VERTRAUT, async ($, on) => {
@@ -2480,4 +2527,134 @@ test('Objective-C (.m) und Sprachen ohne Prüfprogramm: offen NICHT GEPRÜFT sta
   expect(erlang).toContain('Erlang')
   expect(matlab).toContain('✔ «c.m»')
   expect(sprachen).toEqual(['matlab'])
+})
+
+// Unity-Skripte ohne Assembly-CSharp.csproj (bis 1.0.0 nur auf Syntax geprüft): die Mod übersetzt
+// sie selbst mit den Bibliotheken des Unity-Editors der Projektversion, Editor-Skripte mit den Laufzeit-Skripten als Verweis.
+const UNITY_EDITOR = 'C:\\Program Files\\Unity\\Hub\\Editor\\2022.3.62f2\\Editor'
+const unityFiles = (on: On, editorInstalled: boolean) => {
+  const entry = (name: string, kind: 'file' | 'dir') => ({ name, kind, size: 1, mtimeMs: 0, isLink: false })
+  const lists: Record<string, ReturnType<typeof entry>[]> = {
+    'C:\\Program Files\\dotnet\\sdk': [entry('10.0.402', 'dir')],
+    'D:\\u': [entry('Assets', 'dir'), entry('ProjectSettings', 'dir')],
+    'D:\\u\\Assets': [entry('Editor', 'dir'), entry('R.cs', 'file')],
+    'D:\\u\\Assets\\Editor': [entry('E.cs', 'file')],
+    [`${UNITY_EDITOR}\\Data\\NetStandard\\ref`]: [entry('2.0.0', 'dir'), entry('2.1.0', 'dir')],
+    [`${UNITY_EDITOR}\\Data\\Managed\\UnityEngine`]: [entry('UnityEngine.CoreModule.dll', 'file'), entry('UnityEditor.CoreModule.dll', 'file')],
+  }
+  on('fs.list', (_$, e) => ({ value: lists[e.path] ?? [] }))
+  on('fs.exists', (_$, e) => ({ value: editorInstalled || !/\\Unity[\\ ]/.test(e.path) }))
+  on('fs.read', (_$, e) => ({ value: e.path.endsWith('ProjectVersion.txt') ? 'm_EditorVersion: 2022.3.62f2\n' : 'class E { }\n' }))
+}
+
+test('Unity ohne Projektdatei: Editor-Skript wird mit Unity-Bibliotheken und den Laufzeit-Skripten übersetzt, Fehler zählen', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  unityFiles(on, true)
+  const rsp: Record<string, string> = {}
+  on('fs.write', (_$, e) => {
+    if (e.path.endsWith('.rsp')) rsp[e.path.replace(/^.*\\unity_|\.rsp$/g, '')] = String(e.text)
+    return { value: undefined }
+  })
+  on('process.run', (_$, e) => {
+    if (e.argv[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (e.argv.some(a => a.endsWith('unity_editor.rsp'))) {
+      return { value: { ...done, exitCode: 1, stdout: "D:\\u\\Assets\\Editor\\E.cs(3,9): error CS0103: The name 'Rr' does not exist in the current context\r\n" } }
+    }
+    return { value: done }
+  })
+
+  const text = await write($, 'D:\\u\\Assets\\Editor\\E.cs')
+
+  expect(text).toContain('✖ «E.cs»')
+  expect(text).toContain('CS0103')
+  expect(text).toContain('Unity')
+  // Laufzeit-Skripte ohne Editor-Ordner, Editor-Skripte mit der Laufzeit-Bibliothek; C# 9, Unity-Zeichen, neueste netstandard-Fassung
+  expect(rsp.laufzeit).toContain('"D:\\u\\Assets\\R.cs"')
+  expect(rsp.laufzeit).not.toContain('E.cs')
+  expect(rsp.editor).toContain('"D:\\u\\Assets\\Editor\\E.cs"')
+  expect(rsp.editor).toContain('unity_laufzeit.dll"')
+  expect(rsp.editor).toContain('-langversion:9.0')
+  expect(rsp.editor).toContain('UNITY_2022_3_OR_NEWER')
+  expect(rsp.editor).toContain('UNITY_EDITOR')
+  expect(rsp.editor).toContain('NetStandard\\ref\\2.1.0\\netstandard.dll')
+  expect(rsp.editor).toContain('UnityEngine.CoreModule.dll')
+  expect(rsp.editor).toContain('-noconfig')
+})
+
+test('Unity ohne Projektdatei: fehlt der Unity-Editor der Projektversion, bleibt die Syntax mit offenem Grund', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  unityFiles(on, false)
+  on('fs.write', () => ({ value: undefined }))
+  const argvs: string[][] = []
+  on('process.run', (_$, e) => {
+    argvs.push([...e.argv])
+    return { value: e.argv[0] === 'cmd' ? { ...done, stdout: 'C:\\Temp\r\n' } : done }
+  })
+
+  const text = await write($, 'D:\\u\\Assets\\Editor\\E.cs')
+
+  expect(text).toContain('✔ «E.cs»')
+  expect(text).toContain('Unity-Editor 2022.3.62f2 ist nicht installiert')
+  expect(argvs.some(a => a.some(x => x.startsWith('@')))).toBe(false)
+})
+
+test('Unity ohne Projektdatei: "nie zugewiesen" ist bei Unity kein Hinweis, ungenutzte Variablen schon', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  unityFiles(on, true)
+  on('fs.write', () => ({ value: undefined }))
+  on('process.run', (_$, e) => {
+    if (e.argv[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    return {
+      value: {
+        ...done,
+        stdout:
+          "D:\\u\\Assets\\R.cs(4,20): warning CS0649: Field 'R.w' is never assigned to, and will always have its default value null\r\n" +
+          "D:\\u\\Assets\\R.cs(7,13): warning CS0168: The variable 'x' is declared but never used\r\n",
+      },
+    }
+  })
+
+  const text = await write($, 'D:\\u\\Assets\\R.cs')
+
+  expect(text).toContain('✔ «R.cs»')
+  expect(text).toContain('CS0168')
+  expect(text).not.toContain('CS0649')
+})
+
+test('/scan: Unity-Skripte ohne Projektdatei werden mit Unity übersetzt, jede Skriptgruppe nur einmal', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\Probe' : e.name === 'TEMP' ? 'C:\\Temp' : undefined }))
+  unityFiles(on, true)
+  on('fs.stat', (_$, e) => ({ value: { kind: /\.\w+$/.test(e.path) ? ('file' as const) : ('dir' as const), size: 1, mtimeMs: 0, isLink: false } }))
+  const writes: { path: string; text: string }[] = []
+  on('fs.write', (_$, e) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
+  const laeufe: string[] = []
+  on('process.run', (_$, e) => {
+    const rsp = e.argv.find(a => a.startsWith('@'))
+    if (rsp) laeufe.push(rsp.replace(/^.*\\unity_|\.rsp$/g, ''))
+    if (rsp?.endsWith('unity_editor.rsp')) {
+      return { value: { ...done, exitCode: 1, stdout: "D:\\u\\Assets\\Editor\\E.cs(3,9): error CS0103: The name 'Rr' does not exist in the current context\r\n" } }
+    }
+    return { value: e.argv[0] === 'cmd' ? { ...done, stdout: 'C:\\Temp\r\n' } : done }
+  })
+
+  await $.command.run({ command: 'scan', args: 'D:\\u\\Assets' } as never)
+  const result = await scanResult($, 'Scan Assets')
+  const report = writes.find(w => w.path.endsWith('Assets_Fehlerbericht.txt'))?.text ?? ''
+
+  expect(laeufe).toEqual(['laufzeit', 'editor'])
+  expect(report).toContain('E.cs')
+  expect(report).toContain('CS0103')
+  expect(report).not.toContain('kein Projekt gefunden')
+  expect(result).toContain('Fehler')
 })

@@ -1,6 +1,6 @@
 {
   "name": "code-waechter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Code-Wächter / Code Guard: prüft jede Datei, die Claude schreibt, sofort auf Fehler, Sicherheitslücken und Verbesserungen (C#, VB.NET, F#, C/C++, Assembler, Python, PHP, JavaScript/TypeScript, Vue, Svelte, HTML/CSS/SCSS, XML, JSON, YAML, TOML, SQL, Lua, Luau, Shell, Batch, PowerShell, Java, Kotlin, Go, Rust, Zig, Ruby, Perl, Swift, Dart, Scala, Haskell, OCaml, Elixir, Julia, R, Fortran, Pascal, Ada, Odin, Lisp, MATLAB, Solidity, Terraform, Bicep, CMake, Makefile, Nix, Shader (HLSL, GLSL, Unity, CUDA, WGSL), Verilog, VHDL, Unity, Unreal, Godot, Blender-Skripte) und zeigt alles gegliedert in der Seitenleiste. Führt nie Code aus nicht freigegebenen Ordnern aus. Checks every file Claude writes for errors, security holes and improvements, in German or English.",
   "displayName": "Code-Wächter / Code Guard",
   "author": { "name": "Käse_Hobel" },

@@ -1351,10 +1351,14 @@ async function checkDotnet($: any, file: string): Promise<Outcome> {
   const project = /\.csproj$/i.test(file) ? file : await findProject($, file)
   let out: Outcome
   if (!project) {
-    // Ohne Projekt (z. B. Unity-Skripte, Unreal-Build.cs) bleibt nur die Syntax, die der Roslyn-Übersetzer allein prüfen kann.
-    out = isCs
-      ? await checkCsSyntax($, file, t('kein Projekt gefunden', 'no project found'))
-      : unchecked(t('C#-Übersetzung', 'C# build'), t('kein Projekt (.csproj) im Ordner oder darüber gefunden', 'no project (.csproj) found in this folder or above'))
+    // Unity-Skripte ohne Assembly-CSharp.csproj übersetzt die Mod selbst mit den Bibliotheken des Unity-Editors. Sonst (oder wenn
+    // das nicht geht, z. B. Unreal-Build.cs) bleibt nur die Syntax, die der Roslyn-Übersetzer allein prüfen kann.
+    const unity = isCs ? await checkUnityCs($, file) : undefined
+    if (unity && unity.status !== 'ungeprueft') out = unity
+    else if (isCs) {
+      const syntax = await checkCsSyntax($, file, unity ? unity.reason : t('kein Projekt gefunden', 'no project found'))
+      out = syntax.status === 'ungeprueft' && unity ? unity : syntax
+    } else out = unchecked(t('C#-Übersetzung', 'C# build'), t('kein Projekt (.csproj) im Ordner oder darüber gefunden', 'no project (.csproj) found in this folder or above'))
   } else if (!(await isTrusted($, project))) {
     out = isCs ? await checkCsSyntax($, file, NOT_TRUSTED()) : unchecked(t('C#-Übersetzung', 'C# build'), NOT_TRUSTED())
   } else {
@@ -1441,7 +1445,7 @@ async function wpfProject($: any, project: string, projText: string): Promise<Wp
       if (x.isLink) continue
       if (x.kind === 'dir') {
         if (!SKIP.test(`${p}\\`) && !/^bin$/i.test(x.name)) dirs.push(p)
-      } else if (x.kind === 'file' && /\.(xaml|cs)$/i.test(x.name) && (x.size ?? 0) <= MAX_FILE_BYTES) {
+      } else if (x.kind === 'file' && /\.(xaml|cs)$/i.test(x.name)) {
         const text = await readText($, p)
         if (text !== undefined) (/\.xaml$/i.test(x.name) ? xaml : cs).push({ file: p, text })
       }
@@ -1576,6 +1580,211 @@ async function checkCsSyntax($: any, file: string, why: string): Promise<Outcome
   if (real.length > 0) return { status: 'fehler', what, mine: real, others: [] }
   if (mine.length > 0) return { status: 'ok', what, others: [], limit }
   return unchecked(what, t('der Übersetzer nannte nur andere Dateien', 'the compiler only named other files'))
+}
+
+// ====================================================================================== Unity-Skripte ohne Projektdatei
+// Unity legt Assembly-CSharp.csproj nur an, wenn ein Code-Editor dafür eingestellt ist; nach einem Umzug oder Aufräumen fehlt sie oft
+// (bis 1.0.0 wurden die Skripte dann nur auf Syntax geprüft). Dann übersetzt die Mod die Skripte selbst wie Unity: alle
+// Laufzeit-Skripte unter Assets zusammen, die Skripte in Editor-Ordnern mit den Laufzeit-Skripten als Verweis, gegen die Bibliotheken
+// des Unity-Editors der Projektversion (ProjectSettings\ProjectVersion.txt). csc.dll mit -noconfig lädt keine Analysatoren oder
+// Generatoren: hier läuft kein Code des Projekts, darum braucht es keinen freigegebenen Ordner.
+// Gemessen 30.10.2026 mit Unity 2022.3.62f2: 4 Laufzeit- und 23 Editor-Skripte in je rund 1 Sekunde, ohne Fehler; Unity selbst
+// übersetzt dieselben Dateien ohne Fehler.
+const UNITY_MAX_FILES = 5000
+
+// Unity-Versionen, für die Unity UNITY_<Jahr>_<Stand>_OR_NEWER setzt (5.3 bis 2023.2, danach 6000.x).
+const UNITY_RELEASES: [number, number][] = [
+  [5, 3], [5, 4], [5, 5], [5, 6],
+  ...[2017, 2018, 2019].flatMap(y => [1, 2, 3, 4].map(m => [y, m] as [number, number])),
+  ...[2020, 2021, 2022].flatMap(y => [1, 2, 3].map(m => [y, m] as [number, number])),
+  [2023, 1], [2023, 2],
+]
+
+// Verweise je Unity-Editor (Ordner ...\Editor): einmal gesucht.
+const unityRefCache = new Map<string, string[]>()
+
+// Der Hauptordner des Unity-Projekts der Datei (enthält Assets und ProjectSettings).
+async function unityRoot($: any, file: string): Promise<string | undefined> {
+  let dir = dirName(file)
+  for (let i = 0; i < 12 && dir.length > 3; i++) {
+    const all = (await names($, dir)).map(n => n.toLowerCase())
+    if (all.includes('assets') && all.includes('projectsettings')) return dir
+    dir = dirName(dir)
+  }
+  return undefined
+}
+
+// Der installierte Unity-Editor genau dieser Version: Unity Hub (Standardordner oder eigener Ordner aus den Hub-Einstellungen)
+// oder eine Einzelinstallation. Eine andere Version gilt nicht: ihre Bibliotheken haben andere Typen und meldeten Fehler, die keine sind.
+async function findUnityEditor($: any, version: string): Promise<string | undefined> {
+  const roots = ['C:\\Program Files\\Unity\\Hub\\Editor', 'D:\\Program Files\\Unity\\Hub\\Editor']
+  try {
+    const appdata = String((await $.env.get('APPDATA')) ?? '').trim()
+    if (appdata) {
+      const own = await readText($, `${appdata}\\UnityHub\\secondaryInstallPath.json`)
+      const p = own ? JSON.parse(own) : ''
+      if (typeof p === 'string' && isAbsolute(p)) roots.unshift(norm(p).replace(/\\+$/, ''))
+    }
+  } catch {
+    // Ohne Hub-Einstellungen bleiben die Standardordner.
+  }
+  const candidates = [...roots.map(r => `${r}\\${version}\\Editor`), `C:\\Program Files\\Unity ${version}\\Editor`]
+  for (const c of candidates) if (await $.fs.exists(`${c}\\Data\\Managed\\UnityEngine`)) return c
+  return undefined
+}
+
+// Die Bibliotheken, gegen die Unity Skripte übersetzt: netstandard (neueste Fassung im Editor), alle UnityEngine- und
+// UnityEditor-Module und die schon übersetzten Pakete des Projekts (Library\ScriptAssemblies ohne die Skripte selbst).
+async function unityReferences($: any, editor: string, root: string): Promise<string[]> {
+  let base = unityRefCache.get(editor.toLowerCase())
+  if (!base) {
+    const ns = `${editor}\\Data\\NetStandard\\ref`
+    const nsVersion = (await names($, ns)).filter(n => /^\d/.test(n)).sort(versionCompare)[0]
+    const managed = `${editor}\\Data\\Managed\\UnityEngine`
+    base = [
+      ...(nsVersion ? [`${ns}\\${nsVersion}\\netstandard.dll`] : []),
+      ...(await names($, managed)).filter(n => /\.dll$/i.test(n)).sort().map(n => `${managed}\\${n}`),
+    ]
+    if (base.length > 1) unityRefCache.set(editor.toLowerCase(), base)
+  }
+  const sa = `${root}\\Library\\ScriptAssemblies`
+  const packages = (await names($, sa)).filter(n => /\.dll$/i.test(n) && !/^Assembly-CSharp/i.test(n)).sort().map(n => `${sa}\\${n}`)
+  return [...base, ...packages]
+}
+
+// Die Zeichen, die Unity beim Übersetzen setzt: Editor unter Windows, Plattform Windows, .NET Standard und die Versionszeichen.
+function unityDefines(version: string, netstandard: string): string[] {
+  const m = /^(\d+)\.(\d+)/.exec(version)
+  const major = m ? Number(m[1]) : 0
+  const minor = m ? Number(m[2]) : 0
+  const releases = [...UNITY_RELEASES, ...(major >= 6000 ? Array.from({ length: minor + 1 }, (_, i) => [6000, i] as [number, number]) : [])]
+  const older = releases.filter(([y, s]) => y < major || (y === major && s <= minor)).map(([y, s]) => `UNITY_${y}_${s}_OR_NEWER`)
+  const ns = /^2\.1/.test(netstandard) ? ['NET_STANDARD_2_1', 'NETSTANDARD2_1'] : ['NET_STANDARD_2_0', 'NETSTANDARD2_0']
+  return [
+    'UNITY_EDITOR', 'UNITY_EDITOR_WIN', 'UNITY_EDITOR_64', 'UNITY_STANDALONE', 'UNITY_STANDALONE_WIN', 'UNITY_64', 'UNITY_ASSERTIONS',
+    'ENABLE_MONO', 'DEBUG', 'TRACE', 'NET_STANDARD', 'NETSTANDARD', ...ns,
+    `UNITY_${major}`, `UNITY_${major}_${minor}`, `UNITY_${major}_OR_NEWER`, ...older,
+  ]
+}
+
+// Alle C#-Skripte unter Assets, ohne Erzeugnisse und ohne Verknüpfungen.
+async function unityScripts($: any, root: string): Promise<string[] | undefined> {
+  const out: string[] = []
+  const dirs = [`${root}\\Assets`]
+  while (dirs.length > 0) {
+    const dir = dirs.shift() as string
+    let entries: { name: string; kind: string; isLink?: boolean }[] = []
+    try {
+      entries = await $.fs.list(dir)
+    } catch {
+      continue
+    }
+    for (const x of entries) {
+      const p = `${dir}\\${x.name}`
+      if (x.isLink) continue
+      if (x.kind === 'dir') {
+        if (!SKIP.test(`${p}\\`)) dirs.push(p)
+      } else if (x.kind === 'file' && /\.cs$/i.test(x.name)) {
+        out.push(p)
+        if (out.length > UNITY_MAX_FILES) return undefined
+      }
+    }
+  }
+  return out
+}
+
+// Gehört die Datei zu den Editor-Skripten (ein Ordner namens Editor unter Assets)?
+const isUnityEditorScript = (root: string, file: string): boolean => /\\Editor\\/i.test(norm(file).slice(root.length))
+
+// Unity speichert Felder selbst (JsonUtility, Inspector): "nie zugewiesen" (CS0649, CS0169, CS0414) ist dort kein Hinweis.
+const UNITY_NO_HINT = /^CS(0649|0169|0414)$/
+
+// Fehlende Typen oder Namensräume: ein Paket, dessen Bibliothek Unity noch nicht übersetzt hat (oder ein Tippfehler im Namen).
+const UNITY_MISSING_REF = /^CS(0246|0234|0012)$/
+
+// Ein Übersetzerlauf einer Skriptgruppe; ein Scan merkt ihn sich (memo), damit jede Gruppe nur einmal übersetzt wird.
+type UnityRun = { text: string; exitCode: number } | Outcome
+
+async function checkUnityCs($: any, file: string, memo?: Map<string, Promise<UnityRun>>): Promise<Outcome | undefined> {
+  const root = await unityRoot($, file)
+  if (!root) return undefined
+  const editorScript = isUnityEditorScript(root, file)
+  const what = t(
+    `C#-Übersetzung mit Unity (${editorScript ? 'Editor-Skripte' : 'Laufzeit-Skripte'}, Laufzeitverhalten nicht geprüft)`,
+    `C# build with Unity (${editorScript ? 'editor scripts' : 'runtime scripts'}, runtime behaviour not checked)`,
+  )
+  const versionText = await readText($, `${root}\\ProjectSettings\\ProjectVersion.txt`)
+  const version = /m_EditorVersion:\s*(\S+)/.exec(versionText ?? '')?.[1]
+  if (!version) return unchecked(what, t('Unity-Version des Projekts unbekannt (ProjectSettings\\ProjectVersion.txt)', 'Unity version of the project unknown (ProjectSettings\\ProjectVersion.txt)'))
+  const editor = await findUnityEditor($, version)
+  if (!editor) return unchecked(what, t(`Unity-Editor ${version} ist nicht installiert`, `Unity editor ${version} is not installed`))
+  cscCache = cscCache ?? discoverCsc($)
+  const csc = await cscCache
+  if (!csc) {
+    cscCache = undefined
+    return unchecked(what, t('Roslyn-Übersetzer (csc.dll) im .NET-SDK nicht gefunden', 'Roslyn compiler (csc.dll) not found in the .NET SDK'))
+  }
+  const refs = await unityReferences($, editor, root)
+  if (refs.length < 2) return unchecked(what, t(`Bibliotheken im Unity-Editor ${version} nicht gefunden`, `libraries not found in Unity editor ${version}`))
+  const scripts = await unityScripts($, root)
+  if (!scripts) return unchecked(what, t(`mehr als ${UNITY_MAX_FILES} Skripte unter Assets`, `more than ${UNITY_MAX_FILES} scripts under Assets`))
+  // Die geprüfte Datei gehört immer dazu, auch wenn das Auflisten sie (noch) nicht zeigte.
+  if (!scripts.some(s => same(s, file))) scripts.push(file)
+  const runtime = scripts.filter(s => !isUnityEditorScript(root, s))
+  const editorFiles = scripts.filter(s => isUnityEditorScript(root, s))
+  const netstandard = /\\ref\\([^\\]+)\\netstandard\.dll$/i.exec(refs[0])?.[1] ?? '2.1.0'
+  const defines = unityDefines(version, netstandard).join(';')
+  const dir = await sessionDir($)
+  const q = (s: string): string => `"${s}"`
+  // Eine Antwortdatei (@datei): Hunderte Verweise und Skripte passen nicht in eine Befehlszeile (Grenze 32767 Zeichen).
+  // -langversion:9.0: Unity übersetzt mit C# 9; neuere Sprachmittel sind dort ein Fehler.
+  const compile = (name: string, files: string[], extra: string[]): Promise<UnityRun> => {
+    const key = `${root.toLowerCase()}|${name}`
+    const known = memo?.get(key)
+    if (known) return known
+    const run = compileOnce(name, files, extra)
+    memo?.set(key, run)
+    return run
+  }
+  const compileOnce = async (name: string, files: string[], extra: string[]): Promise<UnityRun> => {
+    const rsp = `${dir}\\unity_${name}.rsp`
+    const args = [
+      '-nologo', '-noconfig', '-nostdlib', '-unsafe+', '-fullpaths', '-utf8output', '-preferreduilang:en', '-langversion:9.0',
+      '-target:library', q(`-out:${dir}\\unity_${name}.dll`), q(`-define:${defines}`),
+      ...[...refs, ...extra].map(r => q(`-r:${r}`)), ...files.map(q),
+    ]
+    await $.fs.write(rsp, args.join('\r\n'))
+    const r = await sh($, ['dotnet', csc, `@${rsp}`], { env: { DOTNET_CLI_UI_LANGUAGE: 'en', DOTNET_NOLOGO: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1' }, timeoutMs: 180000 })
+    if (!r.ok) return unchecked(what, t('dotnet konnte nicht laufen: ', 'dotnet could not run: ') + r.reason)
+    if (r.truncated) return unchecked(what, TRUNCATED())
+    return { text: `${r.stdout}\n${r.stderr}`, exitCode: r.exitCode }
+  }
+  let run = await compile('laufzeit', runtime, [])
+  if ('status' in run) return run
+  if (editorScript) {
+    const runtimeErrors = parseCompiler(run.text)
+    // Ohne übersetzte Laufzeit-Skripte fehlen den Editor-Skripten ihre Typen: die Fehler der Laufzeit-Skripte gelten dann als
+    // Fehler anderer Dateien, die eigene Datei bleibt ungeprüft.
+    if (run.exitCode !== 0) {
+      return runtimeErrors.length > 0
+        ? { status: 'ok', what, others: runtimeErrors, limit: t('Editor-Skripte nicht übersetzt (Laufzeit-Skripte haben Fehler)', 'editor scripts not built (runtime scripts have errors)') }
+        : unchecked(what, t(`Übersetzer endete mit Code ${run.exitCode}`, `compiler exited with code ${run.exitCode}`))
+    }
+    run = await compile('editor', editorFiles, [`${dir}\\unity_laufzeit.dll`])
+    if ('status' in run) return run
+  }
+  const findings = parseCompiler(run.text)
+  if (run.exitCode !== 0 && findings.length === 0) {
+    const m = /error\s+([A-Z]+\d+):\s*(.*)/.exec(run.text)
+    return unchecked(what, m ? daten(`${m[1]} ${m[2]}`, 160) : t(`Übersetzer endete mit Code ${run.exitCode}`, `compiler exited with code ${run.exitCode}`))
+  }
+  const mine = findings.filter(f => same(f.file, file))
+  const missing = mine.filter(f => UNITY_MISSING_REF.test(f.code))
+  if (missing.length > 0 && missing.length === mine.length) {
+    return unchecked(what, t('Typ oder Namensraum unbekannt (Paket noch nicht von Unity übersetzt?): ', 'type or namespace unknown (package not yet built by Unity?): ') + daten(missing[0].text, 120))
+  }
+  const hints = parseCompiler(run.text, undefined, 'warning').filter(w => CS_HINT.test(w.code) && !UNITY_NO_HINT.test(w.code))
+  return withHints(verdict(what, findings, file), hints, file)
 }
 
 // ====================================================================================== Lua
@@ -2785,8 +2994,83 @@ async function readText($: any, file: string): Promise<string | undefined> {
   try {
     return String(await $.fs.read(file))
   } catch {
+    return readLargeText($, file)
+  }
+}
+
+// ====================================================================================== Große Dateien lesen
+// $.fs.read liest höchstens 4 MiB je Aufruf (Schnittstelle von Claude Code). Größere Dateien teilt ein PowerShell-Aufruf an
+// Zeilenenden (eine längere Zeile an einer UTF-8-Zeichengrenze) in Stücke von höchstens 3 MiB; die Mod liest die Stücke und setzt
+// den Text unverändert wieder zusammen. So läuft jede Prüfung, die den Text selbst liest (Zugangsdaten, Konfliktmarken,
+// Sicherheitsmuster, Hinweise), auch bei großen Dateien. Bis 30.10.2026 galt stattdessen eine feste Grenze von 20 MB: eine
+// 34-MB-Unity-Datei blieb ungeprüft, obwohl ihr Prüfer sie in 0,4 Sekunden schafft (gemessen 30.10.2026).
+const FS_READ_MAX = 4 * 1024 * 1024
+// Der zuletzt gelesene große Text (gleiche Größe und Änderungszeit): ein Scan liest dieselbe Datei mehrmals, mehrere Prüfungen
+// auch gleichzeitig. Gemerkt wird darum der laufende Lesevorgang, nicht erst sein Ergebnis.
+let largeTextCache: { key: string; text: Promise<string | undefined> } | undefined
+
+// Stücke älterer Läufe (über 10 Minuten) räumt jeder Lauf weg; die eines gleichzeitigen Laufs bleiben unberührt.
+const SPLIT_PS = [
+  "$ErrorActionPreference = 'Stop'",
+  "Get-ChildItem -LiteralPath $env:CW_DIR -Filter 'grossdatei_*.txt' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } | Remove-Item -Force -ErrorAction SilentlyContinue",
+  '$b = [IO.File]::ReadAllBytes($env:CW_FILE)',
+  '$max = 3MB; $i = 0; $n = 0',
+  'while ($i -lt $b.Length) {',
+  '  $end = [Math]::Min($i + $max, $b.Length)',
+  '  if ($end -lt $b.Length) {',
+  '    $j = [Array]::LastIndexOf($b, [byte]10, $end - 1, $end - $i)',
+  '    if ($j -ge $i) { $end = $j + 1 } else { while ($end -gt $i + 1 -and ($b[$end] -band 0xC0) -eq 0x80) { $end-- } }',
+  '  }',
+  '  $part = New-Object byte[] ($end - $i)',
+  '  [Array]::Copy($b, $i, $part, 0, $end - $i)',
+  "  [IO.File]::WriteAllBytes((Join-Path $env:CW_DIR ($env:CW_PREFIX + '_' + $n + '.txt')), $part)",
+  '  $i = $end; $n++',
+  '}',
+  "'STUECKE:' + $n",
+].join('\n')
+
+async function readLargeText($: any, file: string): Promise<string | undefined> {
+  let st: { kind: string; size: number; mtimeMs: number }
+  try {
+    st = await $.fs.stat(file)
+  } catch {
     return undefined
   }
+  if (st.kind !== 'file' || st.size <= FS_READ_MAX) return undefined
+  const key = `${norm(file).toLowerCase()}|${st.size}|${st.mtimeMs}`
+  if (largeTextCache?.key === key) return largeTextCache.text
+  const text = readInPieces($, file)
+  largeTextCache = { key, text }
+  // Ein Fehlversuch bleibt nicht gemerkt: der nächste Aufruf versucht es noch einmal.
+  if ((await text) === undefined && largeTextCache?.key === key) largeTextCache = undefined
+  return text
+}
+
+async function readInPieces($: any, file: string): Promise<string | undefined> {
+  const dir = await sessionDir($)
+  const prefix = `grossdatei_${++counter}`
+  const r = await sh($, ['powershell', '-NoProfile', '-NonInteractive', '-Command', SPLIT_PS], {
+    env: { CW_FILE: file, CW_DIR: dir, CW_PREFIX: prefix },
+    timeoutMs: 120000,
+  })
+  const n = Number(/STUECKE:(\d+)/.exec(r.ok ? r.stdout : '')?.[1] ?? NaN)
+  if (!r.ok || r.exitCode !== 0 || !Number.isInteger(n) || n < 1) return undefined
+  const parts: string[] = []
+  for (let i = 0; i < n && parts.length === i; i++) {
+    try {
+      parts.push(String(await $.fs.read(`${dir}\\${prefix}_${i}.txt`)))
+    } catch {
+      // Ein Stück fehlt: der Text wäre unvollständig, also gar keiner.
+    }
+  }
+  // Die Stücke werden gleich wieder gelöscht (nur die dieses Laufs, nur im eigenen Temp-Ordner des Chats).
+  await safe(
+    sh($, ['powershell', '-NoProfile', '-NonInteractive', '-Command', "Remove-Item -Path (Join-Path $env:CW_DIR ($env:CW_PREFIX + '_*.txt')) -Force -ErrorAction SilentlyContinue"], {
+      env: { CW_DIR: dir, CW_PREFIX: prefix },
+      timeoutMs: 20000,
+    }),
+  )
+  return parts.length === n ? parts.join('') : undefined
 }
 
 async function syntaxOf($: any, kind: Kind, file: string): Promise<Outcome> {
@@ -2941,28 +3225,15 @@ async function runKind($: any, kind: Kind, file: string): Promise<Outcome> {
   }
 }
 
-// Mehrere Prüfungen derselben Datei (z. B. XAML: erst XML, dann Projekt). Hört beim ersten Fehler oder Nicht-Prüfen auf.
-const MAX_FILE_BYTES = 20 * 1024 * 1024
-
 async function checkFile($: any, file: string, kinds: Kind[]): Promise<Outcome> {
   const out = await checkKinds($, file, kinds)
-  // Zugangsdaten und Konfliktmarken in jeder Dateiart (zu große Dateien sind ausgenommen).
-  return out.status === 'ungeprueft' && out.reason.startsWith('#zu-gross#') ? { ...out, reason: out.reason.slice(10) } : withUniversal($, file, out)
+  // Zugangsdaten und Konfliktmarken in jeder Dateiart, auch in großen Dateien (readText liest sie in Stücken).
+  return withUniversal($, file, out)
 }
 
+// Mehrere Prüfungen derselben Datei (z. B. XAML: erst XML, dann Projekt). Hört beim ersten Fehler oder Nicht-Prüfen auf.
+// Eine Größengrenze gibt es nicht: die Prüfer lesen die Datei selbst, die Mod liest große Dateien in Stücken (readLargeText).
 async function checkKinds($: any, file: string, kinds: Kind[]): Promise<Outcome> {
-  try {
-    const st = await $.fs.stat(file)
-    if (st.kind === 'file' && st.size > MAX_FILE_BYTES) {
-      const mb = Math.round(st.size / 1048576)
-      return unchecked(
-        t('Prüfung', 'check'),
-        `#zu-gross#${t(`Datei ist mit ${mb} MB zu groß für die Sofortprüfung (Grenze ${MAX_FILE_BYTES / 1048576} MB)`, `file is ${mb} MB, too large for the instant check (limit ${MAX_FILE_BYTES / 1048576} MB)`)}`,
-      )
-    }
-  } catch {
-    // Größe nicht lesbar: die Prüfung selbst meldet, wenn die Datei fehlt.
-  }
   let last: Outcome = unchecked(t('Prüfung', 'check'), t('keine Prüfung vorgesehen', 'no check available'))
   for (const kind of kinds) {
     last = await runKind($, kind, file)
@@ -3361,6 +3632,18 @@ const withContext = (ran: any, notes: (string | undefined)[]): any => {
   return texts.length > 0 ? { ...ran, context: [...(ran.context ?? []), ...texts] } : ran
 }
 
+// Bricht die Prüfung selbst ab, sagt die Mod das offen, statt still nichts zu melden.
+const crashedNote = (file: string, err: unknown): string => {
+  const why = daten(String((err as { message?: string })?.message ?? err), 140)
+  const name = file === '' ? t('Datei', 'file') : fileName(norm(file))
+  return withDataNote([
+    t(
+      `${GUARD()} ? ${name}: NICHT GEPRÜFT – interner Fehler der Prüfung: ${why}; die Datei bitte mit /scan prüfen.`,
+      `${GUARD()} ? ${name}: NOT CHECKED – internal error of the check: ${why}; please check the file with /scan.`,
+    ),
+  ])
+}
+
 // Ergebnisse aus der Warteliste hängen sich an die nächste Werkzeugmeldung, egal welches Werkzeug.
 async function deliverPending($: any, e: any, next: any): Promise<any> {
   const ran = await next(e)
@@ -3376,14 +3659,16 @@ async function deliverPending($: any, e: any, next: any): Promise<any> {
 async function guarded($: any, e: any, next: any): Promise<any> {
   const ran = await next(e)
   if (ran.deny !== undefined || ran.isError === true) return ran
+  const file = String(e.file_path ?? '')
+  let own: string | undefined
   try {
-    const file = String(e.file_path ?? '')
-    const own = await checkOne($, file)
-    const reminder = own === undefined ? undefined : await openReminder($, norm(file))
-    return withContext(ran, [own, reminder])
-  } catch {
-    return ran
+    own = await checkOne($, file)
+  } catch (err) {
+    return withContext(ran, [crashedNote(file, err)])
   }
+  // Die Erinnerung an offene Fehler ist Zugabe: fällt sie aus, kommt das Prüfergebnis trotzdem an.
+  const reminder = own === undefined ? undefined : await openReminder($, norm(file)).catch(() => undefined)
+  return withContext(ran, [own, reminder])
 }
 
 // Überschreitet ein Prüf-Hook seine Zeit (oder bricht er ab), ging das Werkzeug schon durch: dann bekommt Claude wenigstens
@@ -3443,18 +3728,23 @@ async function guardedShell($: any, e: any, next: any): Promise<any> {
     let checked = 0
     // Höchstens MAX_SHELL_PATHS Pfade nachsehen (ein Befehl kann tausende nennen); gezählt werden nur wirklich geschriebene Dateien.
     for (const file of all.slice(0, MAX_SHELL_PATHS)) {
+      let st: { kind: string; mtimeMs: number }
       try {
-        const st = await $.fs.stat(file)
-        // Gleiche Änderungszeit wie bei der letzten Prüfung: Der Befehl hat die Datei nur gelesen, nicht geschrieben.
-        const unchanged = lastMtime.get(file.toLowerCase()) === st.mtimeMs
-        if (st.kind === 'file' && st.mtimeMs >= startedAt - 2000 && !unchanged) {
-          if (checked < MAX_SHELL_FILES) {
-            checked++
-            notes.push(await checkOne($, file))
-          } else notChecked++
-        }
+        st = await $.fs.stat(file)
       } catch {
-        // Datei gibt es nicht (mehr): nichts zu prüfen.
+        continue // Datei gibt es nicht (mehr): nichts zu prüfen.
+      }
+      // Gleiche Änderungszeit wie bei der letzten Prüfung: Der Befehl hat die Datei nur gelesen, nicht geschrieben.
+      const unchanged = lastMtime.get(file.toLowerCase()) === st.mtimeMs
+      if (st.kind === 'file' && st.mtimeMs >= startedAt - 2000 && !unchanged) {
+        if (checked < MAX_SHELL_FILES) {
+          checked++
+          try {
+            notes.push(await checkOne($, file))
+          } catch (err) {
+            notes.push(crashedNote(file, err))
+          }
+        } else notChecked++
       }
     }
     if (all.length > MAX_SHELL_PATHS) {
@@ -3474,8 +3764,8 @@ async function guardedShell($: any, e: any, next: any): Promise<any> {
       )
     }
     return withContext(ran, notes)
-  } catch {
-    return ran
+  } catch (err) {
+    return withContext(ran, [crashedNote('', err)])
   }
 }
 
@@ -3727,12 +4017,7 @@ async function duplicateGuids($: any, files: string[]): Promise<Finding[]> {
   const out: Finding[] = []
   for (const f of files) {
     if (!/\.meta$/i.test(f)) continue
-    // Unity-.meta-Dateien sind wenige KB groß; eine riesige wird nicht ganz eingelesen.
-    try {
-      if ((await $.fs.stat(f)).size > 1048576) continue
-    } catch {
-      continue
-    }
+    // Unity-.meta-Dateien sind meist wenige KB groß; eine große liest readText in Stücken.
     const text = await readText($, f)
     const m = text === undefined ? null : /^guid:\s*([0-9a-f]{32})\s*$/m.exec(text)
     if (!m) continue
@@ -3785,6 +4070,8 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
     const { files, truncated, omitted } = await listFiles($, target.dir)
     const projects = files.filter(f => /\.csproj$/i.test(f))
     const projectOf = new Map<string, string | undefined>()
+    // Unity-Skripte ohne Projektdatei: jede Skriptgruppe (Laufzeit, Editor) wird in diesem Scan nur einmal übersetzt.
+    const unityMemo = new Map<string, Promise<UnityRun>>()
     // Nur Projekte, die in diesem Scan wirklich übersetzt wurden, zählen für ihre C#-Dateien als "übersetzt", und nur für Dateien,
     // die sie laut ihrer Dateiliste auch übersetzen.
     const built = new Map<string, Set<string>>()
@@ -3849,7 +4136,10 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
           : list
             ? t(`gehört nicht zur Übersetzung von ${baseName(proj)}`, `not compiled by ${baseName(proj)}`)
             : (whyNotBuilt.get(pkey) ?? t('Projekt wurde in diesem Scan nicht übersetzt', 'project was not built in this scan'))
-        o = await withCrashRules($, file, await withUniversal($, file, await checkCsSyntax($, file, why)))
+        // Ohne Projekt: Unity-Skripte mit den Unity-Bibliotheken übersetzen (wie bei der Sofortprüfung), sonst nur die Syntax.
+        const unity = proj ? undefined : await checkUnityCs($, file, unityMemo)
+        const cs = unity && unity.status !== 'ungeprueft' ? unity : await checkCsSyntax($, file, unity?.status === 'ungeprueft' ? unity.reason : why)
+        o = await withCrashRules($, file, await withUniversal($, file, cs))
         kinds = []
       }
       if (o === undefined) {
