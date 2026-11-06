@@ -8,6 +8,13 @@ import { t } from './i18n'
 
 export type GameFinding = { file: string; line: number; col: number; code: string; text: string }
 
+// Ein Name aus dem Projekt (z. B. der Dateiname) in einem eigenen Text: in «…», ohne Steuer- und Richtungszeichen, gekürzt.
+// Die Mod zeigt eigene Texte ungekennzeichnet; so bleibt ein Dateiname, der wie eine Anweisung lautet, als Daten erkennbar.
+function quoted(s: string): string {
+  const x = s.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿«»]/g, ' ').trim()
+  return `«${x.length > 120 ? `${x.slice(0, 119)}…` : x}»`
+}
+
 // Zeilen, die länger sind, bekommen keine Muster-Vorschläge (verkleinerter oder erzeugter Code); gezählt wird trotzdem alles.
 const MAX_RULE_LINE = 4000
 const MAX_HINTS = 50
@@ -152,11 +159,19 @@ function unityCsHints(text: string, file: string): GameFinding[] {
     const line = lines[i]
     if (line.length <= MAX_RULE_LINE) {
       const start = UPDATE_METHOD.exec(line)
+      // "void Update() => …;" gilt nur für diese eine Zeile; "abstract void Update();" hat keinen Körper und beginnt nichts.
+      let oneLine = false
       if (start && methodDepth < 0) {
-        method = start[1]
-        methodDepth = depth
+        const rest = line.slice(start.index + start[0].length)
+        if (/^\s*=>/.test(rest)) {
+          method = start[1]
+          oneLine = true
+        } else if (!/^\s*;/.test(rest)) {
+          method = start[1]
+          methodDepth = depth
+        }
       }
-      if (methodDepth >= 0) {
+      if (methodDepth >= 0 || oneLine) {
         for (const rule of PER_FRAME) {
           const m = rule.re.exec(line)
           if (m) {
@@ -165,6 +180,7 @@ function unityCsHints(text: string, file: string): GameFinding[] {
           }
         }
       }
+      if (oneLine) method = ''
       for (const rule of ANYWHERE) {
         const m = rule.re.exec(line)
         if (m) out.push({ file, line: i + 1, col: m.index + 1, code: 'UNITY', text: rule.text() })
@@ -202,7 +218,8 @@ const REFLECT = /^\s*(UCLASS|USTRUCT|UINTERFACE|UENUM)\s*\(/
 const DYNAMIC_DELEGATE = /^\s*DECLARE_DYNAMIC_(?:MULTICAST_)?(?:SPARSE_)?DELEGATE\w*\s*\(/
 const GENERATED = /\bGENERATED_(?:UCLASS_|USTRUCT_|UINTERFACE_|IINTERFACE_)?BODY\s*\(/g
 const INCLUDE = /^\s*#\s*include\s+["<]([^">]+)[">]/
-const RAW_UOBJECT_POINTER = /^\s*(?:class\s+)?([UA][A-Z]\w*)\s*\*\s*\w+\s*(?:=\s*nullptr\s*)?;/
+// Namen nur aus Grossbuchstaben, Ziffern und _ (ANSICHAR, UTF8CHAR, UINT) sind Zeichen- oder Zahltypen, keine UObjects.
+const RAW_UOBJECT_POINTER = /^\s*(?:class\s+)?(?![A-Z0-9_]+\s*\*)([UA][A-Z]\w*)\s*\*\s*\w+\s*(?:=\s*nullptr\s*)?;/
 
 // Für jede Zeile: steht ihr Anfang direkt im Körper einer class/struct, und kam seit der letzten Anweisung ein UPROPERTY(...)?
 function classMembers(bare: string): { inClass: boolean[]; uproperty: boolean[] } {
@@ -291,7 +308,7 @@ function unrealChecks(text: string, file: string): { errors: GameFinding[]; hint
       line: lastInclude >= 0 ? lastInclude + 1 : 1,
       col: 1,
       code: 'UHT',
-      text: t(`#include "${generated}" fehlt (Unreal Header Tool bricht ab)`, `#include "${generated}" is missing (Unreal Header Tool will fail)`),
+      text: t(`#include ${quoted(generated)} fehlt (Unreal Header Tool bricht ab)`, `#include ${quoted(generated)} is missing (Unreal Header Tool will fail)`),
     })
   } else if (generatedAt !== lastInclude) {
     errors.push({
@@ -299,7 +316,7 @@ function unrealChecks(text: string, file: string): { errors: GameFinding[]; hint
       line: generatedAt + 1,
       col: 1,
       code: 'UHT',
-      text: t(`"${generated}" muss die letzte #include-Zeile sein`, `"${generated}" must be the last #include line`),
+      text: t(`${quoted(generated)} muss die letzte #include-Zeile sein`, `${quoted(generated)} must be the last #include line`),
     })
   }
   const have = (kept.match(GENERATED) ?? []).length

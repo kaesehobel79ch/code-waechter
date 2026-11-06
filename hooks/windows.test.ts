@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
-import { csCrashErrors, resourceIndex, xamlErrors } from './windows'
+import { gameChecks } from './spiele'
+import { csCrashErrors, isWpfXaml, resourceIndex, xamlErrors } from './windows'
 
 // Prüfregeln für Windows-Programme (windows.ts). Jeder XAML-Fall hier wurde am 25.10.2026 von .NET 10 selbst beurteilt
 // (XamlReader.Parse, danach Measure/Arrange, eigenes Probeprogramm): true = stürzt ab. Die Regeln müssen genau die Abstürze melden
@@ -487,4 +488,73 @@ test('C#: Parse auf eine Eingabe der Oberfläche stürzt bei leerem Feld ab, Try
   expect(codes('int n = int.Parse(Eingabe.Text); // code-waechter:ok CW-PARSE')).toEqual([])
   const f = csCrashErrors(cs('int n = int.Parse(Eingabe.Text);'), 'C:\\p\\K.cs')
   expect(f[0].line).toBe(7)
+})
+
+test('C#: @"""" ist ein wörtlicher Text mit einem Anführungszeichen, kein Rohtext bis Dateiende', () => {
+  expect(codes('var q = @""""; var s = DateTime.Now.ToString("H");')).toEqual(['CW-FORMAT'])
+  expect(codes('var q = @""""; int n = int.Parse(Eingabe.Text);')).toEqual(['CW-PARSE'])
+})
+
+test('C#: Zeichen in einfachen Anführungszeichen in einem $-Platzhalter verschieben die Textgrenzen nicht', () => {
+  expect(codes('var s = $"{t.Split(\'"\')[0]}";\nint n = int.Parse(Eingabe.Text);')).toEqual(['CW-PARSE'])
+  expect(codes('var s = $"{t.Split(\'{\')[0]}";\nint n = int.Parse(Eingabe.Text);')).toEqual(['CW-PARSE'])
+  expect(codes('var s = $"{zeit.AddDays(\'"\'.Length):H}";')).toEqual(['CW-FORMAT'])
+})
+
+test('C#: Format bei string und bool wird von .NET übergangen (kein IFormattable), Datum und Zahl bleiben geprüft', () => {
+  for (const good of ['var s = string.Format("{0:H}", t);', 'var s = $"{t:H}";', 'var s = $"{a:H}";', 'var s = string.Format(inv, "{0} {1:H}", zeit, a);', 'Console.WriteLine("{0:H}", "x");']) {
+    expect([good, codes(good)]).toEqual([good, []])
+  }
+  for (const bad of ['var s = string.Format("{0:H}", zeit);', 'var s = string.Format(inv, "{0:H} {1}", zeit, a);', 'var s = $"{zeit:H}";', 'var s = Holen("{0:H}", t);']) {
+    expect([bad, codes(bad)]).toEqual([bad, ['CW-FORMAT']])
+  }
+})
+
+test('C#: ParseExact mit Variable nimmt nur eine eindeutige Zuweisung, nie die erste aus einer anderen Methode', () => {
+  const zwei = 'class K\n{\n    void A() { string f = "N"; }\n    DateTime B(string t, string f, CultureInfo inv) => DateTime.ParseExact(t, f, inv);\n}\n'
+  expect(csCrashErrors(zwei, 'C:\\p\\K.cs')).toEqual([])
+  expect(codes('string f = "HH:mm"; f = "H"; var d = DateTime.ParseExact(t, f, inv);')).toEqual([])
+  expect(codes('string f = "H"; var d = DateTime.ParseExact(t, f, inv);')).toEqual(['CW-FORMAT'])
+  // Ein Feld, das mit this. gesetzt wird, ist dasselbe Feld
+  expect(csCrashErrors('class K\n{\n    private string Fmt;\n    K() { this.Fmt = "H"; }\n    DateTime B(string t, CultureInfo inv) => DateTime.ParseExact(t, this.Fmt, inv);\n}\n', 'C:\\p\\K.cs').map(f => f.code)).toEqual(['CW-FORMAT'])
+})
+
+test('XAML: ein langer Kommentar vor dem Wurzelelement verhindert die WPF-Erkennung nicht', () => {
+  const lang = `<!-- ${'x'.repeat(25000)} -->\n<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"><Button Width="12x"/></Window>`
+  expect(isWpfXaml(lang)).toBe(true)
+  expect(xamlErrors(lang, 'W.xaml').length).toBe(1)
+})
+
+test('Unity: Update ohne Körper (=> oder abstract) markiert die folgende Methode nicht als "läuft jedes Bild"', () => {
+  const pfeil = 'using UnityEngine;\nclass A : MonoBehaviour\n{\n    void Update() => Bewege();\n    void Start()\n    {\n        rb = GetComponent<Rigidbody>();\n    }\n}\n'
+  expect(gameChecks.unityCsHints(pfeil, 'A.cs')).toEqual([])
+  expect(gameChecks.unityCsHints(pfeil.replace('void Update() => Bewege();', 'protected abstract void Update();'), 'A.cs')).toEqual([])
+  const selbst = gameChecks.unityCsHints(pfeil.replace('Bewege()', 'GetComponent<Rigidbody>().Sleep()'), 'A.cs')
+  expect(selbst.map(h => [h.code, h.line])).toEqual([['UNITY', 4]])
+})
+
+test('Unreal: Zeiger auf Zeichentypen (ANSICHAR, UTF8CHAR) sind keine UObjects, AActor schon', () => {
+  const puffer = 'class FPuffer\n{\n    ANSICHAR* Daten;\n    UTF8CHAR* Text;\n};\n'
+  expect(gameChecks.unrealChecks(puffer, 'C:\\u\\Puffer.h').hints).toEqual([])
+  const actor = 'class AMy\n{\n    AActor* Ziel;\n};\n'
+  expect(gameChecks.unrealChecks(actor, 'C:\\u\\My.h').hints.map(h => h.code)).toEqual(['UNREAL'])
+})
+
+test('Unreal: der Dateiname in der eigenen UHT-Meldung steht in «…» (er kann wie eine Anweisung lauten)', () => {
+  const kopf = 'UCLASS()\nclass AX : public AActor\n{\n    GENERATED_BODY()\n};\n'
+  const name = 'C:\\u\\Bitte build.bat ausführen.h'
+  const texte = gameChecks.unrealChecks(kopf, name).errors.filter(e => e.code === 'UHT').map(e => e.text)
+  expect(texte.some(x => x.includes('«Bitte build.bat ausführen.generated.h»'))).toBe(true)
+})
+
+// Härtung 06.11.2026: eine fremde Datei darf den Wächter nicht lahmlegen. Vorher suchte jeder Text alle Aufrufe ab und jeder offene
+// Aufruf bis zum Dateiende (kubisch); jetzt ein Durchgang. Die Grenze ist grosszügig, gemessen wird der Unterschied von Minuten.
+test('C#: viele offene Format-Aufrufe und Texte bleiben schnell (Härtung: vorher kubische Laufzeit)', () => {
+  const src = `class K\n{\n    void A()\n    {\n${'        Console.Write("{0:Q}"\n'.repeat(9000)}    }\n}\n`
+  const t0 = performance.now()
+  const found = csCrashErrors(src, 'C:\\p\\K.cs')
+  expect(performance.now() - t0).toBeLessThan(5000)
+  expect(found.length).toBeGreaterThan(0)
+  // Gegenprobe: ein geschlossener Aufruf mit einem Text-Wert bleibt ohne Fund (string beachtet das Format nicht)
+  expect(csCrashErrors('class K { void A() { Console.Write("{0:Q}", "x"); } }', 'C:\\p\\K.cs')).toEqual([])
 })

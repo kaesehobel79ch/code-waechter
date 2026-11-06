@@ -71,6 +71,78 @@ function receiverKind(before: string): FormatKind {
   return m ? TYPE_FORMAT[m[1]] : 'any'
 }
 
+// Ein Wert, bei dem .NET das Format übergeht: string und bool haben kein IFormattable (Microsoft-Doku zu String und Boolean),
+// und ohne IFormattable wird das Format nicht beachtet (Microsoft-Doku "Composite formatting": "the format string … is ignored").
+// Erkannt werden ein Text "…", true/false und ein Name, der in der Datei als string oder bool festgelegt ist.
+function nonFormattable(kept: string, expr: string): boolean {
+  const x = expr.trim()
+  if (/^@?"[^"]*"$/.test(x) || /^(?:true|false)$/.test(x)) return true
+  if (!/^[A-Za-z_]\w*$/.test(x)) return false
+  return new RegExp(`\\b(?:string|bool|String|Boolean)\\??\\s+${x}\\b`).test(kept)
+}
+
+const COMPOSITE_CALL = /(?:\b(?:string|String)\s*\.\s*Format|\.\s*AppendFormat|\bConsole\s*\.\s*Write(?:Line)?)\s*\(/g
+
+// Die öffnenden Klammern der Treffer eines Aufrufmusters (das Muster endet mit "(").
+const opensOf = (kept: string, re: RegExp): number[] => [...kept.matchAll(re)].map(m => (m.index ?? 0) + m[0].length - 1)
+
+// Zu jeder gefragten öffnenden Klammer die schliessende, in EINEM Durchgang über die Datei (bare: Texte und Kommentare geleert).
+// Fehlt ein Eintrag, wird die Klammer nie geschlossen. Gemerkt werden nur die gefragten Klammern samt Tiefe, der Speicher bleibt
+// klein. Vorher suchte jeder Aufruf selbst bis zur passenden Klammer, bei unfertigem Code bis zum Dateiende, und das für jeden
+// Text erneut (Härtung 06.11.2026: kubische Laufzeit bei vielen offenen Aufrufen).
+function closersFor(bare: string, opens: number[]): Map<number, number> {
+  const want = new Set(opens)
+  const out = new Map<number, number>()
+  const stack: { at: number; depth: number }[] = []
+  let depth = 0
+  for (let i = 0; i < bare.length; i++) {
+    const x = bare[i]
+    if (x === '(' || x === '[' || x === '{') {
+      if (want.has(i)) stack.push({ at: i, depth })
+      depth++
+    } else if (x === ')' || x === ']' || x === '}') {
+      depth--
+      const top = stack[stack.length - 1]
+      if (top !== undefined && top.depth === depth) {
+        out.set(top.at, i)
+        stack.pop()
+      }
+    }
+  }
+  return out
+}
+
+// Der Wert zum Platzhalter {n} eines Texts, der als Vorlage an string.Format, AppendFormat oder Console.Write[Line] geht.
+// Gefragt wird in der Reihenfolge der Texte (litStart wächst). Die Aufrufe werden dabei einmal vorwärts durchlaufen, mit einem
+// Stapel der noch offenen; der innerste offene ist der einzige, dessen Vorlage der Text sein kann.
+function compositeArgs(kept: string, bare: string, close: Map<number, number>): (litStart: number, n: number) => string | undefined {
+  const opens = opensOf(kept, COMPOSITE_CALL)
+  const memo = new Map<number, { start: number; end: number }[]>()
+  const stack: number[] = []
+  let next = 0
+  let last = -1
+  return (litStart: number, n: number): string | undefined => {
+    if (litStart < last) {
+      stack.length = 0
+      next = 0
+    }
+    last = litStart
+    while (next < opens.length && opens[next] < litStart) stack.push(opens[next++])
+    while (stack.length > 0 && (close.get(stack[stack.length - 1]) ?? -1) < litStart) stack.pop()
+    const open = stack[stack.length - 1]
+    if (open === undefined) return undefined
+    let args = memo.get(open)
+    if (!args) {
+      args = callArgs(bare, open, close)
+      memo.set(open, args)
+    }
+    const k = args.findIndex(a => litStart >= a.start && litStart < a.end)
+    if (k < 0 || k > 1 || !/^\s*@?$/.test(kept.slice(args[k].start, litStart))) return undefined
+    const a = args[k + 1 + n]
+    return a ? kept.slice(a.start, a.end) : undefined
+  }
+}
+
 type Literal = { start: number; end: number; interp: boolean; holes: { start: number; end: number }[] }
 
 // Alle Texte ("...", @"...", $"...", $@"...", """...""") mit Anfang und Ende; bei $-Texten die Platzhalter {…}.
@@ -102,7 +174,8 @@ function literals(src: string): Literal[] {
     }
     let quotes = 0
     while (src[i + quotes] === '"') quotes++
-    if (quotes >= 3) {
+    // Rohtext """…""" nie mit @: @"""" ist ein wörtlicher Text mit einem Anführungszeichen ("" darin), kein Rohtext.
+    if (quotes >= 3 && !verbatim) {
       const close = src.indexOf('"'.repeat(quotes), i + quotes)
       const end = close < 0 ? n : close + quotes
       out.push({ start: i, end, interp: false, holes: [] })
@@ -146,6 +219,12 @@ function holeEnd(src: string, open: number): number {
   let depth = 0
   for (let i = open; i < src.length; i++) {
     const x = src[i]
+    // Zeichen wie '"' oder '{' im Platzhalter sind weder Textanfang noch Klammer.
+    if (x === "'") {
+      i++
+      while (i < src.length && src[i] !== "'" && src[i] !== '\n') i += src[i] === '\\' ? 2 : 1
+      continue
+    }
     if (x === '"') {
       i++
       while (i < src.length && src[i] !== '"' && src[i] !== '\n') i += src[i] === '\\' ? 2 : 1
@@ -165,6 +244,11 @@ function holeFormat(src: string, start: number, end: number): { expr: string; fm
   let depth = 0
   for (let i = start; i < end; i++) {
     const x = src[i]
+    if (x === "'") {
+      i++
+      while (i < end && src[i] !== "'") i += src[i] === '\\' ? 2 : 1
+      continue
+    }
     if (x === '"') {
       i++
       while (i < end && src[i] !== '"') i += src[i] === '\\' ? 2 : 1
@@ -184,11 +268,14 @@ function holeFormat(src: string, start: number, end: number): { expr: string; fm
 }
 
 // Die Argumente eines Aufrufs ab der öffnenden Klammer, als Bereiche; Struktur aus bare (Texte geleert), Inhalt aus kept.
-function callArgs(bare: string, open: number): { start: number; end: number }[] {
+// close: die schliessenden Klammern aus closersFor. Wird der Aufruf nie geschlossen (unfertiger Code), gibt es keine Argumente.
+function callArgs(bare: string, open: number, close: Map<number, number>): { start: number; end: number }[] {
   const args: { start: number; end: number }[] = []
+  const last = close.get(open)
+  if (last === undefined) return args
   let depth = 0
   let from = open + 1
-  for (let i = open; i < bare.length; i++) {
+  for (let i = open; i <= last; i++) {
     const x = bare[i]
     if (x === '(' || x === '[' || x === '{') depth++
     else if (x === ')' || x === ']' || x === '}') {
@@ -215,10 +302,17 @@ function exactFormats(kept: string, bare: string, arg: { start: number; end: num
   if (/^@?"[^"\\]*"$/.test(text) || /[{[]/.test(text)) return literalsIn(arg.start, arg.end)
   const name = /^(?:this\s*\.\s*)?([A-Za-z_]\w*)$/.exec(text)?.[1]
   if (!name) return []
-  const one = new RegExp(`\\b${name}\\s*=\\s*@?"([^"\\\\\\n]*)"\\s*;`).exec(kept)
+  // Nur eine einzige Zuweisung des Namens in der Datei ist eindeutig; bei mehreren (andere Methode, spätere Änderung) wird nichts
+  // gemeldet, statt die erste zu raten. obj.f = … zählt nicht (kein Punkt davor), this.f = … schon (dasselbe Feld).
+  const own = `(?:(?<![.\\w])|(?<=\\bthis\\s*\\.\\s*))`
+  const ones = [...kept.matchAll(new RegExp(`${own}${name}\\s*=\\s*@?"([^"\\\\\\n]*)"\\s*;`, 'g'))]
+  const lists = [...kept.matchAll(new RegExp(`${own}${name}\\s*=\\s*(?:new\\s*(?:string)?\\s*\\[\\s*\\]\\s*)?[{[]`, 'g'))]
+  // Ebenso, wenn der Name mehrmals festgelegt wird (Feld oder Variable hier, Parameter dort).
+  const decls = [...kept.matchAll(new RegExp(`(?:\\b(?:string|String)\\s*(?:\\[\\s*\\])?\\??|\\bvar)\\s+${name}\\b`, 'g'))]
+  if (ones.length + lists.length !== 1 || decls.length > 1) return []
+  const one = ones[0]
   if (one) return [{ fmt: one[1], at: (one.index ?? 0) + one[0].indexOf('"') }]
-  const list = new RegExp(`\\b${name}\\s*=\\s*(?:new\\s*(?:string)?\\s*\\[\\s*\\]\\s*)?[{[]`).exec(kept)
-  if (!list) return []
+  const list = lists[0]
   const open = (list.index ?? 0) + list[0].length - 1
   let depth = 0
   for (let i = open; i < bare.length; i++) {
@@ -263,7 +357,21 @@ export function csCrashErrors(text: string, file: string): WinFinding[] {
     errors.push({ file, line, col: index - starts[line - 1] + 1, code, text: msg })
   }
   const lits = literals(kept)
-  const inLiteral = (i: number): boolean => lits.some(l => i > l.start && i < l.end)
+  // Die Texte liegen geordnet und ohne Überlappung: Suche durch Halbieren statt jeden Text anzusehen.
+  const inLiteral = (i: number): boolean => {
+    let lo = 0
+    let hi = lits.length - 1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (i <= lits[mid].start) hi = mid - 1
+      else if (i >= lits[mid].end) lo = mid + 1
+      else return true
+    }
+    return false
+  }
+  // Alle Klammerpaare der gefragten Aufrufe in einem Durchgang.
+  const close = closersFor(bare, [...opensOf(kept, COMPOSITE_CALL), ...opensOf(kept, EXACT_CALL), ...opensOf(kept, PARSE_CALL)])
+  const compositeArg = compositeArgs(kept, bare, close)
 
   for (const l of lits) {
     if (l.interp) {
@@ -271,14 +379,18 @@ export function csCrashErrors(text: string, file: string): WinFinding[] {
         const f = holeFormat(kept, h.start, h.end)
         if (!f) continue
         const kind = receiverKind(f.expr)
+        if (kind === 'any' && nonFormattable(kept, f.expr)) continue
         if (badShortFormat(f.fmt, kind)) add(f.at, 'CW-FORMAT', formatText(f.fmt, kind))
       }
       continue
     }
     // Platzhalter mit Nummer in gewöhnlichen Texten: "{0:H}" für string.Format, Console.WriteLine, AppendFormat ...
     const body = kept.slice(l.start, l.end)
-    for (const m of body.matchAll(/(?<!\{)\{\s*\d+\s*(?:,\s*-?\d+\s*)?:([^{}"]*)\}/g)) {
-      if (badShortFormat(m[1], 'any')) add(l.start + (m.index ?? 0), 'CW-FORMAT', formatText(m[1], 'any'))
+    for (const m of body.matchAll(/(?<!\{)\{\s*(\d+)\s*(?:,\s*-?\d+\s*)?:([^{}"]*)\}/g)) {
+      if (!badShortFormat(m[2], 'any')) continue
+      const value = compositeArg(l.start, Number(m[1]))
+      if (value !== undefined && nonFormattable(kept, value)) continue
+      add(l.start + (m.index ?? 0), 'CW-FORMAT', formatText(m[2], 'any'))
     }
   }
 
@@ -292,7 +404,7 @@ export function csCrashErrors(text: string, file: string): WinFinding[] {
   for (const m of kept.matchAll(EXACT_CALL)) {
     const at = m.index ?? 0
     if (inLiteral(at)) continue
-    const args = callArgs(bare, at + m[0].length - 1)
+    const args = callArgs(bare, at + m[0].length - 1, close)
     if (!args[1]) continue
     const kind = TYPE_FORMAT[m[1]]
     for (const f of exactFormats(kept, bare, args[1])) if (badShortFormat(f.fmt, kind)) add(f.at, 'CW-FORMAT', formatText(f.fmt, kind))
@@ -302,7 +414,7 @@ export function csCrashErrors(text: string, file: string): WinFinding[] {
   for (const m of kept.matchAll(PARSE_CALL)) {
     const at = m.index ?? 0
     if (inLiteral(at) || tries.some(b => at > b.start && at < b.end)) continue
-    const first = callArgs(bare, at + m[0].length - 1)[0]
+    const first = callArgs(bare, at + m[0].length - 1, close)[0]
     if (!first || !/\.\s*Text\b/.test(kept.slice(first.start, first.end))) continue
     const call = m[0].replace(/\s+/g, '').replace(/\($/, '')
     add(
@@ -337,7 +449,8 @@ function decode(v: string): string {
 
 // Die Elemente einer XAML-Datei der Reihe nach, mit Eltern; Kommentare, CDATA und Anweisungen übersprungen.
 // Ist der Aufbau kaputt, endet die Liste dort (die XML-Prüfung davor meldet das).
-function elements(text: string): El[] {
+// max: nach so vielen Elementen aufhören (isWpfXaml braucht nur das Wurzelelement, egal wie lang ein Kommentar davor ist).
+function elements(text: string, max = Infinity): El[] {
   const out: El[] = []
   const stack: El[] = []
   const attrRe = /\s+([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/y
@@ -386,6 +499,7 @@ function elements(text: string): El[] {
     const e = endRe.exec(text)
     if (!e) break
     out.push(el)
+    if (out.length >= max) break
     if (e[1] !== '/') stack.push(el)
     i = endRe.lastIndex
   }
@@ -661,7 +775,7 @@ export function resourceIndex(assembly: string, xaml: { text: string }[], cs: { 
 const NOT_BRUSH = new Set(['Style', 'ControlTemplate', 'DataTemplate', 'HierarchicalDataTemplate', 'ItemsPanelTemplate'])
 
 export function isWpfXaml(text: string): boolean {
-  const root = elements(text.slice(0, 20000))[0]
+  const root = elements(text, 1)[0]
   return !!root && attr(root, 'xmlns')?.value === WPF_NS
 }
 

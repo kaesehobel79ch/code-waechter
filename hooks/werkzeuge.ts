@@ -494,18 +494,39 @@ export async function toolPath($: any, id: ToolId): Promise<string | undefined> 
 //   Einträge von sich aus.
 // - Alle Pfade wörtlich (-LiteralPath, WebClient): eckige Klammern im Ordnernamen sind kein Suchmuster.
 // - Jeder Ladevorgang hat seinen eigenen Zwischenordner, der am Ende immer verschwindet; eine Sperrdatei je Werkzeug verhindert, dass
-//   zwei Chats gleichzeitig dasselbe Werkzeug laden.
+//   zwei Chats gleichzeitig dasselbe Werkzeug laden (auch bei npm und pip, siehe LOCK_PS).
+// - Bricht ein Ladevorgang an der Zeitgrenze ab (process.run höchstens 600000 ms), endet PowerShell hart und räumt nicht auf.
+//   Darum gilt eine Sperre, die älter als 11 Minuten ist, als verwaist, und Zwischenordner älter als 15 Minuten werden beim
+//   nächsten Laden weggeräumt: kein Ladevorgang lebt so lange.
+// - Die Marke enthält die Fassung ("code-waechter 8.5.12"); eine andere Fassung gilt als veraltet und wird neu geladen.
 export const TOOL_MARK = '.code-waechter-werkzeug'
+
+// Längste Laufzeit eines Ladevorgangs (Höchstwert von Claude Code für process.run).
+const LOAD_MS = 600000
+
+const LOCK_LINES = [
+  '[IO.Directory]::CreateDirectory($env:CW_DIR)|Out-Null',
+  "Get-ChildItem -LiteralPath $env:CW_DIR -Filter '_laden_*' -Force -ErrorAction SilentlyContinue | Where-Object {$_.LastWriteTime -lt (Get-Date).AddMinutes(-15)} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue",
+  "$sperre=Join-Path $env:CW_DIR ('.laedt_'+$env:CW_ID)",
+  "if((Test-Path -LiteralPath $sperre) -and ((Get-Item -LiteralPath $sperre).LastWriteTime -lt (Get-Date).AddMinutes(-11))){Remove-Item -LiteralPath $sperre -Force}",
+]
+
+// Sperre für npm und pip (die ohne DOWNLOAD_PS laden): CW_GESPERRT oder CW_BESETZT.
+const LOCK_PS = [
+  "$ErrorActionPreference='Stop'",
+  ...LOCK_LINES,
+  // Besetzt ist es nur, wenn die Sperrdatei wirklich da ist; jeder andere Fehler (Ordner nicht beschreibbar ...) kommt mit Grund.
+  "try{[IO.File]::Open($sperre,'CreateNew').Dispose();Write-Output 'CW_GESPERRT'}catch{if(Test-Path -LiteralPath $sperre){Write-Output 'CW_BESETZT'}else{Write-Output ('CW_FEHLER '+$_.Exception.Message)}}",
+].join(';')
+const UNLOCK_PS = "Remove-Item -LiteralPath (Join-Path $env:CW_DIR ('.laedt_'+$env:CW_ID)) -Force -ErrorAction SilentlyContinue"
 
 const DOWNLOAD_PS = [
   "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'",
   '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12',
   `$ziel=$env:CW_ZIEL;$marke=Join-Path $ziel '${TOOL_MARK}'`,
   "if((Test-Path -LiteralPath $ziel) -and -not (Test-Path -LiteralPath $marke)){Write-Output 'CW_FREMD';exit 5}",
-  '[IO.Directory]::CreateDirectory($env:CW_DIR)|Out-Null',
-  "$sperre=Join-Path $env:CW_DIR ('.laedt_'+$env:CW_ID)",
-  "if((Test-Path -LiteralPath $sperre) -and ((Get-Item -LiteralPath $sperre).LastWriteTime -lt (Get-Date).AddMinutes(-30))){Remove-Item -LiteralPath $sperre -Force}",
-  "try{[IO.File]::Open($sperre,'CreateNew').Dispose()}catch{Write-Output 'CW_BESETZT';exit 6}",
+  ...LOCK_LINES,
+  "try{[IO.File]::Open($sperre,'CreateNew').Dispose()}catch{if(Test-Path -LiteralPath $sperre){Write-Output 'CW_BESETZT';exit 6};Write-Output ('CW_FEHLER '+$_.Exception.Message);exit 7}",
   "$tmp=Join-Path $env:CW_DIR ('_laden_'+[guid]::NewGuid().ToString('N'));$code=0",
   'try{' +
     '[IO.Directory]::CreateDirectory($tmp)|Out-Null;$datei=Join-Path $tmp $env:CW_NAME;' +
@@ -522,11 +543,19 @@ const DOWNLOAD_PS = [
         '& (Join-Path $env:SystemRoot \'System32\\tar.exe\') -xf $datei -C $x --strip-components $env:CW_STRIP @teile;' +
         "if($LASTEXITCODE -ne 0){Write-Output ('CW_TAR_FEHLER '+$LASTEXITCODE);$code=4}" +
       '}else{[IO.Directory]::CreateDirectory($x)|Out-Null;Move-Item -LiteralPath $datei -Destination (Join-Path $x $env:CW_NAME)};' +
+      // Eine alte Fassung wird nicht gelöscht, sondern erst als Ganzes in den Zwischenordner umbenannt. [IO.Directory]::Move gelingt
+      // ganz oder gar nicht; Remove-Item und Move-Item bleiben bei einer offenen Datei halb stehen (gemessen 06.11.2026: Move-Item
+      // verschob die Marke, die offene Datei blieb, danach galt der Ordner als fremd). Scheitert das Einsetzen, kommt die alte zurück.
       'if($code -eq 0){' +
-        'if(Test-Path -LiteralPath $ziel){Remove-Item -LiteralPath $ziel -Recurse -Force};' +
-        '$k=@(Get-ChildItem -LiteralPath $x -Force);' +
-        "if($env:CW_ART -eq 'zip' -and $k.Count -eq 1 -and $k[0].PSIsContainer){Move-Item -LiteralPath $k[0].FullName -Destination $ziel}else{Move-Item -LiteralPath $x -Destination $ziel};" +
-        "Set-Content -LiteralPath $marke -Value 'code-waechter' -Encoding ascii;Write-Output 'CW_FERTIG'" +
+        "$alt=Join-Path $tmp 'alt';if(Test-Path -LiteralPath $ziel){[IO.Directory]::Move($ziel,$alt)};" +
+        'try{' +
+          '$k=@(Get-ChildItem -LiteralPath $x -Force);' +
+          "if($env:CW_ART -eq 'zip' -and $k.Count -eq 1 -and $k[0].PSIsContainer){[IO.Directory]::Move($k[0].FullName,$ziel)}else{[IO.Directory]::Move($x,$ziel)};" +
+          "Set-Content -LiteralPath $marke -Value ('code-waechter '+$env:CW_VER) -Encoding ascii;Write-Output 'CW_FERTIG'" +
+        '}catch{' +
+          'if((Test-Path -LiteralPath $alt) -and (Test-Path -LiteralPath $ziel)){Remove-Item -LiteralPath $ziel -Recurse -Force -ErrorAction SilentlyContinue};' +
+          'if((Test-Path -LiteralPath $alt) -and -not (Test-Path -LiteralPath $ziel)){[IO.Directory]::Move($alt,$ziel)};throw' +
+        '}' +
       '}' +
     '}' +
   '}finally{Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue;Remove-Item -LiteralPath $sperre -Force -ErrorAction SilentlyContinue}',
@@ -568,13 +597,29 @@ export function withDependencies(ids: ToolId[]): ToolId[] {
   return out
 }
 
-// Was wirklich geladen werden muss: die gewünschten Werkzeuge samt Abhängigkeiten, ohne die schon vorhandenen.
+// Fassung laut Marke im Ordner des Werkzeugs. undefined: keine Marke der Mod (der Ordner gehört dem Benutzer und bleibt, wie er ist);
+// '': Marke ohne Fassung (älterer Stand der Mod oder abgebrochener Ladevorgang), das Werkzeug gilt als veraltet.
+export async function installedVersion($: any, id: ToolId): Promise<string | undefined> {
+  try {
+    const raw = String(await $.fs.read(`${await toolDir($)}\\${id}\\${TOOL_MARK}`)).trim()
+    const m = /^code-waechter(?:\s+(\S+))?$/.exec(raw)
+    return m ? (m[1] ?? '') : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// Was wirklich geladen werden muss: die gewünschten Werkzeuge samt Abhängigkeiten, ohne die schon vorhandenen in der aktuellen Fassung.
 export async function toInstall($: any, ids: ToolId[]): Promise<ToolDef[]> {
   const out: ToolDef[] = []
   for (const id of withDependencies(ids)) {
-    if (await toolPath($, id)) continue
     const def = TOOLS.find(x => x.id === id)
-    if (def) out.push(def)
+    if (!def) continue
+    if (await toolPath($, id)) {
+      const v = await installedVersion($, id)
+      if (v === undefined || v === def.version) continue
+    }
+    out.push(def)
   }
   return out
 }
@@ -586,54 +631,25 @@ const short = (s: string): string =>
     .trim()
     .slice(0, 200)
 
-// Lädt ein Werkzeug. Rückgabe: Meldungszeile.
-export async function installTool($: any, def: ToolDef, python: string[]): Promise<string> {
-  const dir = await toolDir($)
-  const ziel = `${dir}\\${def.id}`
+// Uhrzeit in ms, 0 wenn die Uhr nicht lesbar ist.
+async function clockNow($: any): Promise<number> {
+  try {
+    return Number(await $.clock.now()) || 0
+  } catch {
+    return 0
+  }
+}
+
+// npm- und pip-Pakete: installieren ins Ziel. Rückgabe: das Ergebnis des Laufs oder eine fertige Meldungszeile.
+async function loadPackage($: any, def: ToolDef, python: string[], dir: string, ziel: string): Promise<Run | string> {
   const q = def.quelle
-  const foreign = t(
-    `✖ ${def.titel}: der Ordner ${ziel} gibt es schon und er gehört nicht der Mod; er bleibt unberührt (selbst löschen oder einen anderen Werkzeugordner einstellen).`,
-    `✖ ${def.titel}: the folder ${ziel} already exists and does not belong to the mod; it is left alone (delete it yourself or choose another checker folder).`,
-  )
-  let r: Run
-  if (q.art === 'zip' || q.art === 'datei' || q.art === 'tar') {
-    r = await run(
-      $,
-      ['powershell', '-NoProfile', '-NonInteractive', '-Command', DOWNLOAD_PS],
-      {
-        CW_DIR: dir,
-        CW_ID: def.id,
-        CW_NAME: q.name,
-        CW_URL: q.url,
-        CW_SHA: q.sha256,
-        CW_ZIEL: ziel,
-        CW_ART: q.art,
-        CW_TEILE: q.art === 'tar' ? q.teile.join('|') : '',
-        CW_STRIP: q.art === 'tar' ? String(q.strip) : '0',
-      },
-      // Höchstwert von Claude Code für process.run: 600000 ms. Mit 900000 lehnte Claude Code 2.1.308 jeden Download ab
-      // ("init.timeoutMs is a whole number of ms, 1 to 600000", gemessen 27.10.2026).
-      600000,
-      dir,
-    )
-    if (r.ok && /CW_FREMD/.test(r.out)) return foreign
-    if (r.ok && /CW_BESETZT/.test(r.out)) {
-      return t(`✖ ${def.titel}: wird gerade schon geladen (anderer Chat); bitte danach noch einmal versuchen.`, `✖ ${def.titel}: already being installed (another chat); please try again afterwards.`)
-    }
-    if (r.ok && /CW_ZIP_UNSICHER/.test(r.out)) {
-      return t(`✖ ${def.titel}: das Paket enthält Pfade außerhalb des Zielordners, verworfen (nichts geladen).`, `✖ ${def.titel}: the archive contains paths outside the target folder, discarded (nothing installed).`)
-    }
-    if (r.ok && /CW_SHA_FALSCH/.test(r.out)) {
-      return t(`✖ ${def.titel}: Prüfsumme stimmt nicht, Datei verworfen (nichts geladen).`, `✖ ${def.titel}: checksum mismatch, file discarded (nothing installed).`)
-    }
-  } else if (await foreignTarget($, ziel)) {
-    return foreign
-  } else if (q.art === 'npm') {
+  if (q.art === 'npm') {
     const node = await toolPath($, 'node')
     if (!node) return t(`✖ ${def.titel}: Node.js fehlt (wird zuerst gebraucht).`, `✖ ${def.titel}: Node.js is missing (needed first).`)
     const nodeDir = node.replace(/\\[^\\]+$/, '')
     try {
-      // Marke zuerst: der Ordner gehört ab jetzt der Mod, auch wenn das Laden abbricht (ein neuer Versuch darf ihn ersetzen).
+      // Marke zuerst (ohne Fassung): der Ordner gehört ab jetzt der Mod, auch wenn das Laden abbricht (ein neuer Versuch darf
+      // ihn ersetzen); die Fassung kommt erst nach dem fertigen Laden dazu.
       await $.fs.write(`${ziel}\\${TOOL_MARK}`, 'code-waechter\n')
       await $.fs.write(`${ziel}\\package.json`, q.paket)
       await $.fs.write(`${ziel}\\package-lock.json`, q.lock)
@@ -647,14 +663,15 @@ export async function installTool($: any, def: ToolDef, python: string[]): Promi
       path = ''
     }
     // npm ci: genau die Fassungen und Prüfsummen der mitgelieferten package-lock.json; passt etwas nicht, bricht es ab.
-    r = await run(
+    return run(
       $,
       [node, `${nodeDir}\\node_modules\\npm\\bin\\npm-cli.js`, 'ci', '--prefix', ziel, '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error'],
       { PATH: `${nodeDir};${path}` },
-      600000,
+      LOAD_MS,
       ziel,
     )
-  } else if (q.art === 'pip') {
+  }
+  if (q.art === 'pip') {
     // Zwischendatei mit eigenem Namen je Ladevorgang, danach gelöscht.
     const req = `${dir}\\_laden_${def.id}_${Date.now().toString(36)}.txt`
     try {
@@ -664,30 +681,104 @@ export async function installTool($: any, def: ToolDef, python: string[]): Promi
       return t(`✖ ${def.titel}: Hilfsdatei nicht schreibbar (${short(String(err))}).`, `✖ ${def.titel}: could not write helper file (${short(String(err))}).`)
     }
     const forPython = q.python ? ['--python-version', q.python, '--implementation', 'cp', '--platform', 'win_amd64'] : []
-    r = await run(
+    const r = await run(
       $,
       [...python, '-m', 'pip', 'install', '--target', ziel, '--upgrade', '--require-hashes', '--only-binary=:all:', '--no-deps', ...forPython, '--disable-pip-version-check', '-r', req],
       { PYTHONSAFEPATH: '1' },
-      600000,
+      LOAD_MS,
       dir, // nicht im Projektordner: "python -m" lädt sonst Module aus dem aktuellen Ordner
     )
     await run($, ['powershell', '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:CW_DATEI -Force -ErrorAction SilentlyContinue'], { CW_DATEI: req }, 20000, dir)
-  } else {
-    return t(`✖ ${def.titel}: unbekannte Quelle.`, `✖ ${def.titel}: unknown source.`)
+    return r
   }
-  if (!r.ok) return t(`✖ ${def.titel}: konnte nicht laufen (${r.reason}).`, `✖ ${def.titel}: could not run (${r.reason}).`)
-  if (!(await toolPath($, def.id))) {
-    const why = short(r.out) || t('keine Rückmeldung', 'no output')
-    return t(`✖ ${def.titel}: nicht geladen (${why}).`, `✖ ${def.titel}: not installed (${why}).`)
-  }
-  if (q.art === 'npm' || q.art === 'pip') {
-    try {
-      await $.fs.write(`${ziel}\\${TOOL_MARK}`, 'code-waechter\n')
-    } catch {
-      // ohne Marke wird der Ordner später nur nicht ersetzt
+  return t(`✖ ${def.titel}: unbekannte Quelle.`, `✖ ${def.titel}: unknown source.`)
+}
+
+// Lädt ein Werkzeug. Rückgabe: Meldungszeile.
+export async function installTool($: any, def: ToolDef, python: string[]): Promise<string> {
+  const dir = await toolDir($)
+  const ziel = `${dir}\\${def.id}`
+  const q = def.quelle
+  const foreign = t(
+    `✖ ${def.titel}: der Ordner ${ziel} gibt es schon und er gehört nicht der Mod; er bleibt unberührt (selbst löschen oder einen anderen Werkzeugordner einstellen).`,
+    `✖ ${def.titel}: the folder ${ziel} already exists and does not belong to the mod; it is left alone (delete it yourself or choose another checker folder).`,
+  )
+  const busy = t(`✖ ${def.titel}: wird gerade schon geladen (anderer Chat); bitte danach noch einmal versuchen.`, `✖ ${def.titel}: already being installed (another chat); please try again afterwards.`)
+  const t0 = await clockNow($)
+  // Gemeinsamer Abschluss: Zeitgrenze benennen, Ergebnis prüfen, bei npm und pip die Marke mit Fassung schreiben.
+  const finish = async (r: Run): Promise<string> => {
+    if (!r.ok) {
+      const now = t0 > 0 ? await clockNow($) : 0
+      if (now > 0 && now - t0 >= LOAD_MS - 1000) {
+        return t(
+          `✖ ${def.titel}: Zeitgrenze von ${LOAD_MS / 60000} Minuten erreicht, Download zu langsam; Reste werden beim nächsten Versuch weggeräumt.`,
+          `✖ ${def.titel}: time limit of ${LOAD_MS / 60000} minutes reached, download too slow; leftovers are removed on the next attempt.`,
+        )
+      }
+      return t(`✖ ${def.titel}: konnte nicht laufen (${r.reason}).`, `✖ ${def.titel}: could not run (${r.reason}).`)
     }
+    // Ein Fehlschlag ist nie "geladen", auch wenn eine alte Fassung noch da ist (sonst bekäme sie bei npm/pip die neue Nummer).
+    // Ein Download meldet seinen Erfolg selbst mit CW_FERTIG.
+    const download = q.art === 'zip' || q.art === 'datei' || q.art === 'tar'
+    if (r.exitCode !== 0 || (download && !/CW_FERTIG/.test(r.out)) || !(await toolPath($, def.id))) {
+      const why = short(r.out) || t('keine Rückmeldung', 'no output')
+      return t(`✖ ${def.titel}: nicht geladen (${why}).`, `✖ ${def.titel}: not installed (${why}).`)
+    }
+    if (q.art === 'npm' || q.art === 'pip') {
+      try {
+        await $.fs.write(`${ziel}\\${TOOL_MARK}`, `code-waechter ${def.version}\n`)
+      } catch {
+        // ohne Fassung in der Marke gilt das Werkzeug später nur als veraltet und wird neu geladen
+      }
+    }
+    return t(`✔ ${def.titel} ${def.version} geladen.`, `✔ ${def.titel} ${def.version} installed.`)
   }
-  return t(`✔ ${def.titel} ${def.version} geladen.`, `✔ ${def.titel} ${def.version} installed.`)
+  if (q.art === 'zip' || q.art === 'datei' || q.art === 'tar') {
+    const r = await run(
+      $,
+      ['powershell', '-NoProfile', '-NonInteractive', '-Command', DOWNLOAD_PS],
+      {
+        CW_DIR: dir,
+        CW_ID: def.id,
+        CW_NAME: q.name,
+        CW_URL: q.url,
+        CW_SHA: q.sha256,
+        CW_ZIEL: ziel,
+        CW_ART: q.art,
+        CW_TEILE: q.art === 'tar' ? q.teile.join('|') : '',
+        CW_STRIP: q.art === 'tar' ? String(q.strip) : '0',
+        CW_VER: def.version,
+      },
+      // Höchstwert von Claude Code für process.run: 600000 ms. Mit 900000 lehnte Claude Code 2.1.308 jeden Download ab
+      // ("init.timeoutMs is a whole number of ms, 1 to 600000", gemessen 27.10.2026).
+      LOAD_MS,
+      dir,
+    )
+    if (r.ok && /CW_FREMD/.test(r.out)) return foreign
+    if (r.ok && /CW_BESETZT/.test(r.out)) return busy
+    if (r.ok && /CW_ZIP_UNSICHER/.test(r.out)) {
+      return t(`✖ ${def.titel}: das Paket enthält Pfade außerhalb des Zielordners, verworfen (nichts geladen).`, `✖ ${def.titel}: the archive contains paths outside the target folder, discarded (nothing installed).`)
+    }
+    if (r.ok && /CW_SHA_FALSCH/.test(r.out)) {
+      return t(`✖ ${def.titel}: Prüfsumme stimmt nicht, Datei verworfen (nichts geladen).`, `✖ ${def.titel}: checksum mismatch, file discarded (nothing installed).`)
+    }
+    return finish(r)
+  }
+  if (await foreignTarget($, ziel)) return foreign
+  // npm und pip: dieselbe Sperrdatei wie bei den Downloads, sonst arbeiten zwei Chats gleichzeitig im selben Ordner.
+  const lock = await run($, ['powershell', '-NoProfile', '-NonInteractive', '-Command', LOCK_PS], { CW_DIR: dir, CW_ID: def.id }, 20000, dir)
+  if (!lock.ok) return t(`✖ ${def.titel}: konnte nicht laufen (${lock.reason}).`, `✖ ${def.titel}: could not run (${lock.reason}).`)
+  if (/CW_BESETZT/.test(lock.out)) return busy
+  if (!/CW_GESPERRT/.test(lock.out)) {
+    const why = short(lock.out) || t('keine Rückmeldung', 'no output')
+    return t(`✖ ${def.titel}: Sperre im Werkzeugordner nicht anlegbar (${why}).`, `✖ ${def.titel}: could not create the lock in the checker folder (${why}).`)
+  }
+  try {
+    const r = await loadPackage($, def, python, dir, ziel)
+    return typeof r === 'string' ? r : await finish(r)
+  } finally {
+    await run($, ['powershell', '-NoProfile', '-NonInteractive', '-Command', UNLOCK_PS], { CW_DIR: dir, CW_ID: def.id }, 20000, dir)
+  }
 }
 
 // Übersicht für den Befehl: was da ist, was fehlt.
@@ -702,10 +793,13 @@ export async function toolOverview($: any): Promise<string> {
   for (const d of TOOLS) {
     const have = await toolPath($, d.id)
     const what = t(d.wofuer[0], d.wofuer[1])
+    const v = have ? await installedVersion($, d.id) : undefined
     lines.push(
-      have
-        ? `  ✔ ${d.id.padEnd(10)} ${d.titel} ${d.version} – ${what}`
-        : `  ✖ ${d.id.padEnd(10)} ${d.titel} ${d.version}, ${d.mb} MB – ${what}`,
+      !have
+        ? `  ✖ ${d.id.padEnd(10)} ${d.titel} ${d.version}, ${d.mb} MB – ${what}`
+        : v !== undefined && v !== d.version
+          ? t(`  ⚠ ${d.id.padEnd(10)} ${d.titel} veraltet (geladen ${v || '?'}, aktuell ${d.version}) – ${what}`, `  ⚠ ${d.id.padEnd(10)} ${d.titel} outdated (installed ${v || '?'}, current ${d.version}) – ${what}`)
+          : `  ✔ ${d.id.padEnd(10)} ${d.titel} ${d.version} – ${what}`,
     )
   }
   lines.push(

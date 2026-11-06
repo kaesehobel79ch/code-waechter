@@ -47,7 +47,8 @@ export async function resolveExe($: any, name: string): Promise<string | undefin
   // Ohne lesbaren Suchpfad (nur in der Testumgebung der Mod) bleibt der Name; der Host der App liefert ihn immer.
   if (path === undefined) return system[key] ?? name
   const candidates = system[key] ? [system[key]] : []
-  const exts = /\.[a-z0-9]{2,4}$/i.test(name) ? [''] : ['.exe', '.com']
+  // Nur .exe/.com gelten als Endung; "python3.14" hat eine Fassungsnummer, keine Endung, und braucht .exe dahinter.
+  const exts = /\.(exe|com)$/i.test(name) ? [''] : ['.exe', '.com']
   for (const dir of (path ?? '').split(';').map(d => d.trim().replace(/^"|"$/g, '').replace(/\\+$/, ''))) {
     if (!isAbsolute(dir)) continue
     for (const ext of exts) candidates.push(`${dir}\\${name}${ext}`)
