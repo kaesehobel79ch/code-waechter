@@ -11,6 +11,7 @@ Freie Software unter der MIT-Lizenz: Jeder darf sie nutzen, verändern und weite
 | Bereich | Prüfung |
 | --- | --- |
 | C# / .NET, XAML | Projekt übersetzen (Namen, Typen, Warnungen und Analyse-Regeln als Vorschläge), sonst Syntax mit Roslyn |
+| C#: Härtung (Hinweise) | `catch` ohne `when`, das jeden Fehler zu "leer" macht (`return null`); Schleife über eine Antwort von aussen (Netzaufruf), die ohne Grenze sammelt; bewusste Stellen mit `code-waechter:ok HAERTUNG` |
 | C# und WPF: Abstürze | Fehler, die das Übersetzen durchlässt und die erst beim Ausführen abstürzen: Formate wie `"H"` statt `"%H"`, `int.Parse` auf ein Eingabefeld (`.Text`), falsche Platzhalter; in XAML falsche Werte (z. B. `Width="12x"`), fehlende `StaticResource`-Namen, ein Stil an Stelle einer Farbe |
 | C / C++ | `cl.exe` (Visual Studio), C nach C17, Header für sich allein (C-Header als C) |
 | Python, Blender-Skripte | pyflakes, dazu Ruff (Fehlerquellen, Leistung, Sicherheit); typische Blender-Schreibweisen (`bpy.props` als Annotation, `importlib.reload`) gelten nicht als Fehler |

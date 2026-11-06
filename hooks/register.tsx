@@ -7,6 +7,7 @@ import { TOOLS, installTool, setToolDirOption, toInstall, toolOverview, toolPath
 import type { ToolId } from './werkzeuge'
 import { gameChecks } from './spiele'
 import { windowsChecks } from './windows'
+import { HARD_CODE, hardeningChecks } from './haertung'
 import { clearExeCache, isAbsolute, resolveExe } from './prozess'
 
 // Code-Wächter: prüft jede Datei, die Claude mit Write oder Edit schreibt, gleich nach dem Schreiben.
@@ -510,7 +511,8 @@ function withHints(o: Outcome, hints: Finding[], file: string): Outcome {
       seen.add(key)
       return true
     })
-    .sort((a, b) => a.line - b.line)
+    // Härtungs-Hinweise zuerst: sie dürfen nicht hinter HINTS_SHOWN anderen Vorschlägen verschwinden.
+    .sort((a, b) => Number(b.code === HARD_CODE) - Number(a.code === HARD_CODE) || a.line - b.line)
   return mine.length > 0 ? { ...o, hints: mine } : o
 }
 
@@ -1422,11 +1424,12 @@ async function checkDotnet($: any, file: string): Promise<Outcome> {
 }
 
 // Unity: Vorschläge für C#-Skripte (teure Aufrufe in Update, CompareTag, leere Unity-Methoden).
+// Dazu die Härtungs-Hinweise (haertung.ts): "jeder Fehler wird leer" und Schleifen über Antworten von aussen ohne Grenze.
 async function withGameHintsCs($: any, file: string, out: Outcome): Promise<Outcome> {
   if (out.status !== 'ok') return out
   const text = await readText($, file)
   if (text === undefined) return out
-  return withHints(out, gameChecks.unityCsHints(text, file), file)
+  return withHints(out, [...gameChecks.unityCsHints(text, file), ...hardeningChecks.csHardeningHints(text, file)], file)
 }
 
 // ====================================================================================== Windows-Programme: Abstürze beim Ausführen
@@ -3782,7 +3785,7 @@ const where = (f: Finding): string =>
 // Dateien stehen auch in eigenen Texten in «…».
 const OWN_CODES = new Set([
   'SEC-BEFEHL', 'SEC-EVAL', 'SEC-EXTRACT', 'SEC-GEHEIMNIS', 'SEC-INCLUDE', 'SEC-PFAD', 'SEC-PREGE', 'SEC-SQL', 'SEC-TLS',
-  'SEC-UNSERIALIZE', 'SEC-WEITERLEITUNG', 'SEC-XSS', 'UNITY', 'UNREAL', 'UHT', 'GIT',
+  'SEC-UNSERIALIZE', 'SEC-WEITERLEITUNG', 'SEC-XSS', 'UNITY', 'UNREAL', 'UHT', 'GIT', HARD_CODE,
 ])
 const isOwn = (code: string): boolean => OWN_CODES.has(code)
 // Die Codes der Sicherheitsmuster auf Englisch, wenn die Meldungen englisch sind (intern bleiben die deutschen Namen).
