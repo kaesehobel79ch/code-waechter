@@ -182,4 +182,71 @@ export function csHardeningHints(text: string, file: string): HardFinding[] {
   return [...catchAllAsEmpty(text, code, file), ...unboundedLoops(text, code, file)].sort((a, b) => a.line - b.line)
 }
 
-export const hardeningChecks = { csHardeningHints }
+// ---- KI-Fehlerarten: häufige Fehler in KI-geschriebenem Code (eingebaute Geheimnisse, Debug-Reste und Merkposten, stille
+// Fehler). Für jede Code-Datei, geprüft wird nur der neu geschriebene Text (Edit: der neue Teil, Write: alles).
+// Ungenutzter Code gehört NICHT hierher: Wer erst ein Feld anlegt und im nächsten Schritt den
+// Aufruf, hätte sonst jeden Zwischenstand rot - das prüft der Bau am Schluss (Prüfwerkzeug des Projekts).
+// Bewusste Stellen: "code-waechter:ok KI" in derselben Zeile.
+
+export type KiBefund = { art: 'geheimnis' | 'debug' | 'merkposten' | 'leerer_fang'; name: string }
+
+const KI_OK = /code-waechter:ok\s+KI\b/
+
+const KI_CODE_DATEI = /\.(?:cs|vb|fs|py|pyw|js|mjs|cjs|ts|tsx|jsx|ps1|psm1|cpp|cc|cxx|c|h|hpp|java|kt|go|rs|php|lua|swift|dart)$/i
+
+// Nur Muster mit eindeutigem Anbieter-Vorsatz - der Fund selbst wird nie ausgegeben.
+const KI_GEHEIMNISSE: [string, RegExp][] = [
+  ['Anthropic-Schlüssel', /sk-ant-[A-Za-z0-9_-]{30,}/],
+  ['OpenAI-Schlüssel', /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}/],
+  ['GitHub-Zugang', /\b(?:ghp|gho|ghs|ghu)_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{40,}/],
+  ['Google-Schlüssel', /\bAIza[0-9A-Za-z_-]{35}\b/],
+  ['Slack-Zugang', /\bxox[baprs]-[A-Za-z0-9-]{10,}/],
+  ['Tavily-Schlüssel', /\btvly-[A-Za-z0-9]{16,}/],
+  ['AWS-Zugang', /\bAKIA[0-9A-Z]{16}\b/],
+  ['Twitch-Token', /\boauth:[a-z0-9]{25,}/],
+  ['Privater Schlüssel', /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/],
+]
+
+function kiDebugMuster(file: string): RegExp | undefined {
+  if (/\.(?:cs|vb|fs)$/i.test(file)) return /\b(?:Debug|Trace)\s*\.\s*(?:Write|WriteLine|Print)\s*\(|\bDebugger\s*\.\s*(?:Break|Launch)\s*\(/
+  if (/\.(?:js|mjs|cjs|ts|tsx|jsx)$/i.test(file)) return /^\s*debugger\s*;?\s*$|\bconsole\s*\.\s*(?:log|debug)\s*\(/m
+  if (/\.pyw?$/i.test(file)) return /\bbreakpoint\s*\(\s*\)|\bpdb\s*\.\s*set_trace\s*\(|^\s*import\s+pdb\b/m
+  return undefined
+}
+
+// Merkposten nur im Kommentar und nur als Merkposten: am Anfang des Kommentars oder mit Doppelpunkt. Eine Variable "TODO" (Pfad
+// zur TO-DO-Datei) oder ein Suchmuster ist keiner.
+const KI_MERKPOSTEN = /^\s*(?:TODO|FIXME|HACK)\b|\b(?:TODO|FIXME|HACK|XXX)\s*:/ // code-waechter:ok KI
+
+function kiKommentar(file: string, zeile: string): string | undefined {
+  const raute = /\.(?:py|pyw|ps1|psm1)$/i.test(file)
+  let i = raute ? zeile.indexOf('#') : zeile.indexOf('//')
+  if (!raute && i < 0) i = zeile.indexOf('/*')
+  return i < 0 ? undefined : zeile.slice(i + (raute ? 1 : 2))
+}
+
+function kiLeererFang(file: string): RegExp | undefined {
+  // Ein Kommentar an "except" oder "pass" ist die Begründung - dann ist der Fang nicht leer.
+  if (/\.pyw?$/i.test(file)) return /^\s*except\b[^\n:#]*:[ \t]*\n\s*pass[ \t]*$/m
+  if (/\.(?:ps1|psm1)$/i.test(file)) return /\bcatch\s*(?:\[[^\]]*\]\s*)?\{\s*\}/i
+  return /\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/
+}
+
+export function kiBefunde(written: string, file: string): KiBefund[] {
+  if (!KI_CODE_DATEI.test(file)) return []
+  // Bewusst markierte Zeilen fallen weg, bevor gesucht wird.
+  const text = (written.length > 200000 ? written.slice(0, 200000) : written)
+    .split('\n').filter(z => !KI_OK.test(z)).join('\n')
+  const befunde: KiBefund[] = []
+  for (const [name, re] of KI_GEHEIMNISSE) if (re.test(text)) befunde.push({ art: 'geheimnis', name })
+  const debug = kiDebugMuster(file)
+  if (debug && debug.test(text)) befunde.push({ art: 'debug', name: 'Debug-Ausgabe' })
+  if (text.split('\n').some(z => { const k = kiKommentar(file, z); return k !== undefined && KI_MERKPOSTEN.test(k) })) {
+    befunde.push({ art: 'merkposten', name: 'Merkposten (TODO/FIXME)' }) // code-waechter:ok KI
+  }
+  const fang = kiLeererFang(file)
+  if (fang && fang.test(text)) befunde.push({ art: 'leerer_fang', name: 'leerer Fang (Fehler wird verschluckt)' })
+  return befunde
+}
+
+export const hardeningChecks = { csHardeningHints, kiBefunde }

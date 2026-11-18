@@ -1,5 +1,27 @@
 import { expect, test } from 'claude-code/testing'
-import { blankCode, csHardeningHints } from './haertung'
+import { blankCode, csHardeningHints, kiBefunde } from './haertung'
+
+// KI-Fehlerarten: jede Art schlägt an, die saubere Form und die bewusste Stelle bleiben still.
+test('KI-Fehlerarten: Geheimnis, Debug-Rest, Merkposten und leerer Fang schlagen an, sauberer Code nicht', () => {
+  const arten = (text: string, datei: string) => kiBefunde(text, datei).map(b => b.art).sort()
+  const schluessel = 'sk-' + 'a'.repeat(40)
+  expect(arten(`var k = "${schluessel}";`, 'D:\\p\\A.cs')).toEqual(['geheimnis'])
+  expect(arten(`var k = "${schluessel}"; // code-waechter:ok KI`, 'D:\\p\\A.cs')).toEqual([])
+  expect(arten('Debug.WriteLine("x");', 'D:\\p\\A.cs')).toEqual(['debug'])
+  expect(arten('try { Lies(); } catch (IOException) { }', 'D:\\p\\A.cs')).toEqual(['leerer_fang'])
+  expect(arten('try { Lies(); } catch (IOException ex) { App.Protokolliere(ex, "Lesen"); }', 'D:\\p\\A.cs')).toEqual([])
+  expect(arten('# TO' + 'DO: spaeter', 'D:\\p\\a.py')).toEqual(['merkposten'])
+  expect(arten('try:\n    lies()\nexcept OSError:\n    pass\n', 'D:\\p\\a.py')).toEqual(['leerer_fang'])
+  expect(arten('try:\n    lies()\nexcept OSError as e:\n    melde(e)\n', 'D:\\p\\a.py')).toEqual([])
+  expect(arten('try:\n    lies()\nexcept OSError:\n    pass   # die Lampe darf nie aufhalten\n', 'D:\\p\\a.py')).toEqual([])
+  expect(arten('TO' + 'DO = os.path.join(d, "TO-DO.txt")', 'D:\\p\\a.py')).toEqual([])
+  expect(arten('x = 1  // TO' + 'DO: aufraeumen', 'D:\\p\\A.cs')).toEqual(['merkposten'])
+  expect(arten('breakpoint()', 'D:\\p\\a.py')).toEqual(['debug'])
+  expect(arten('console.log(x)', 'D:\\p\\a.ts')).toEqual(['debug'])
+  expect(arten('-----BEGIN ' + 'PRIVATE KEY-----', 'D:\\p\\a.ts')).toEqual(['geheimnis'])
+  expect(arten('Debug.WriteLine("x");', 'D:\\p\\notiz.txt')).toEqual([])
+  expect(arten('public int Summe(int a, int b) => a + b;', 'D:\\p\\A.cs')).toEqual([])
+})
 
 // Härtungs-Hinweise (haertung.ts). Gegenprobe gegen zwei echte, inzwischen berichtigte Lücken eines WPF-Programms
 // (Sicherheitsprüfung 06.11.2026): die alte Form schlägt an, die berichtigte bleibt still.

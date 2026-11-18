@@ -4222,6 +4222,34 @@ async function deliverPending($: any, e: any, next: any): Promise<any> {
   return withContext(ran, mine.map(p => p.text))
 }
 
+// KI-Fehlerarten: in jeder Code-Datei der neu geschriebene Text (Edit: der neue Teil, Write: alles) auf eingebaute Geheimnisse
+// (FEHLER), Debug-Reste, Merkposten und leere Fänge (Hinweise). Prüfdateien (*.test.*) enthalten solche Stellen absichtlich und
+// fallen weg.
+async function kiNote(file: string, e: any): Promise<string | undefined> {
+  if (/\.test\.[cm]?[jt]sx?$/i.test(file)) return undefined
+  const parts = [e.content, e.new_string, ...(Array.isArray(e.edits) ? e.edits.map((x: any) => x?.new_string) : [])].filter((x): x is string => typeof x === 'string')
+  if (parts.length === 0) return undefined
+  const befunde = hardeningChecks.kiBefunde(parts.join('\n'), file)
+  if (befunde.length === 0) return undefined
+  const geheim = befunde.filter(b => b.art === 'geheimnis').map(b => b.name)
+  const rest = befunde.filter(b => b.art !== 'geheimnis').map(b => b.name)
+  const name = fileName(file)
+  const teile: string[] = []
+  if (geheim.length > 0) {
+    teile.push(t(
+      `FEHLER: eingebautes Geheimnis im geschriebenen Text (${geheim.join(', ')}) - sofort entfernen, ein Schlüssel im Quelltext ist veröffentlicht`,
+      `ERROR: embedded secret in the written text (${geheim.join(', ')}) - remove it now, a key in source code is a published key`,
+    ))
+  }
+  if (rest.length > 0) {
+    teile.push(t(`zu entfernen oder zu begründen: ${rest.join('; ')}`, `remove or justify: ${rest.join('; ')}`))
+  }
+  return t(
+    `${GUARD()} KI-Fehlerarten ${name}: ${teile.join('. ')}. Bewusste Stelle: "code-waechter:ok KI" in der Zeile.`,
+    `${GUARD()} AI error types ${name}: ${teile.join('. ')}. Deliberate spot: "code-waechter:ok KI" on the line.`,
+  )
+}
+
 // Write und Edit: die geschriebene Datei gleich nach dem Schreiben prüfen.
 async function guarded($: any, e: any, next: any): Promise<any> {
   const ran = await next(e)
@@ -4233,9 +4261,10 @@ async function guarded($: any, e: any, next: any): Promise<any> {
   } catch (err) {
     return withContext(ran, [crashedNote(file, err)])
   }
-  // Die Erinnerung an offene Fehler ist Zugabe: fällt sie aus, kommt das Prüfergebnis trotzdem an.
+  // Die Erinnerung an offene Fehler und die KI-Fehlerarten sind Zugabe: fallen sie aus, kommt das Prüfergebnis trotzdem an.
   const reminder = own === undefined ? undefined : await openReminder($, norm(file)).catch(() => undefined)
-  return withContext(ran, [own, reminder])
+  const ki = own === undefined ? undefined : await kiNote(norm(file), e).catch(() => undefined)
+  return withContext(ran, [own, ki, reminder])
 }
 
 // Überschreitet ein Prüf-Hook seine Zeit (oder bricht er ab), ging das Werkzeug schon durch: dann bekommt Claude wenigstens
