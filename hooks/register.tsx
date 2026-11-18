@@ -1174,6 +1174,10 @@ async function checkPython($: any, file: string): Promise<Outcome> {
   let blender: boolean | undefined // einmal je Datei ermitteln (je Meldung wäre es bei vielen Meldungen quadratisch langsam)
   let matchedAny = false
   const hints: Finding[] = []
+  // Liest die Datei ein anderes Skript mit exec(open(...)) ein, kommen Namen von dort - pyflakes sieht sie nicht (18.11.2026,
+  // ein Blender-Skript: 24 Fehlalarme). Solche Namen sind kein Fehler, aber auch nicht geprüft: das steht offen im ✔.
+  let execLiest: boolean | undefined
+  let ungeprueftExec = 0
   for (const raw of text.split(/\r?\n/)) {
     const m = PYFLAKES_LINE.exec(raw.trim())
     if (m) matchedAny = true
@@ -1188,6 +1192,11 @@ async function checkPython($: any, file: string): Promise<Outcome> {
       const name = /undefined name '([^']+)'/.exec(f.text)?.[1] ?? ''
       if (blender === undefined) blender = BLENDER_FILE.test(lines.join('\n'))
       if (blender && blenderIdiom(lines[f.line - 1] ?? '', f.col, name)) continue
+      if (execLiest === undefined) execLiest = /^\s*exec\s*\(\s*open\s*\(/m.test(lines.join('\n'))
+      if (execLiest) {
+        ungeprueftExec++
+        continue
+      }
     }
     findings.push(f)
   }
@@ -1198,8 +1207,15 @@ async function checkPython($: any, file: string): Promise<Outcome> {
   }
   // Gekappte Ausgabe: der echte Fehler kann hinter den gelesenen 4 MiB stehen.
   if (findings.length === 0 && r.truncated) return unchecked(what, TRUNCATED())
-  const v = verdict(what, findings, file)
-  if (v.status !== 'ok') return v
+  const v0 = verdict(what, findings, file)
+  if (v0.status !== 'ok') return v0
+  const v: Outcome = ungeprueftExec === 0 ? v0 : {
+    ...v0,
+    limit: t(
+      `${ungeprueftExec} unbekannte Namen, die vielleicht aus dem mit exec eingelesenen Skript kommen`,
+      `${ungeprueftExec} unknown names that may come from the script read in with exec`,
+    ),
+  }
   const deeper = await ruffHints($, file)
   return withHints(deeper.length > 0 || (await toolPath($, 'ruff')) ? { ...v, what: 'Python (pyflakes, ruff)' } : v, [...hints, ...deeper], file)
 }
@@ -1550,7 +1566,8 @@ async function wpfProject($: any, project: string, projText: string): Promise<Wp
 // Welche Warnungen des Übersetzers als Vorschlag gelten: Totes (ungenutzte Variablen, unerreichbarer Code), vergessenes await,
 // mögliche Null-Zugriffe und die Regeln für Leistung (CA18xx), Zuverlässigkeit (CA20xx-22xx) und Sicherheit (CA21xx, CA23xx, CA3xxx, CA5xxx).
 // Stilfragen (Namen, Dokumentation, "Non-nullable ...") bleiben weg, damit nichts zugemüllt wird.
-const CS_HINT = /^(?:CS0168|CS0219|CS0162|CS0169|CS0414|CS0649|CS1998|CS4014|CS8602|CS8604|CS8600|CA(?:1001|18\d\d|20\d\d|21\d\d|22\d\d|23\d\d|3\d{3}|5\d{3}))$/
+// Ohne CA5394 (Random ist in Spielen kein Sicherheitsfehler) und CA5400 (Sperrlisten-Abfrage, scheitert ohne Netz).
+const CS_HINT = /^(?:CS0168|CS0219|CS0162|CS0169|CS0414|CS0649|CS1998|CS4014|CS8602|CS8604|CS8600|CA(?:1001|18\d\d|20\d\d|21\d\d|22\d\d|23\d\d|3\d{3}|5(?!394|400)\d{3}))$/
 
 // MSBuild liest beim Bau auch Dateien aus den Ordnern ÜBER dem Projekt, bis zum Laufwerk (Directory.Build.props/.targets,
 // Directory.Packages.props, Directory.Build.rsp; global.json wählt SDKs). Darin kann ein eigener Bauschritt stehen. Liegt so eine
@@ -1595,7 +1612,9 @@ async function buildProject($: any, project: string, file: string): Promise<Outc
       // Warnungen und die Analysegruppe "Recommended" (Leistung, Zuverlässigkeit, Sicherheit) liefern die Verbesserungsvorschläge.
       // TreatWarningsAsErrors aus: eine Warnung darf nie als Fehler erscheinen, auch wenn das Projekt es sonst so einstellt.
       'dotnet', 'build', '--no-restore', '--no-incremental', '-nologo', '-v:q', '-clp:NoSummary', '-nodeReuse:false',
-      '-p:TreatWarningsAsErrors=false', '-p:WarningsAsErrors=', '-p:EnableNETAnalyzers=true', '-p:AnalysisLevel=latest', '-p:AnalysisMode=Recommended',
+      // AnalysisModeSecurity=All: "Recommended" allein meldet ECB, eine Zertifikatsprüfung "immer true" (ServicePointManager) und
+      // zu wenige Runden beim Ableiten aus einem Kennwort nicht (gemessen 18.11.2026, .NET 10).
+      '-p:TreatWarningsAsErrors=false', '-p:WarningsAsErrors=', '-p:EnableNETAnalyzers=true', '-p:AnalysisLevel=latest', '-p:AnalysisMode=Recommended', '-p:AnalysisModeSecurity=All',
       '-p:UseSharedCompilation=false', '-p:PreBuildEvent=', '-p:PostBuildEvent=', `-p:IntermediateOutputPath=${base}/obj/`, `-p:OutDir=${base}/out/`, project,
     ],
     { cwd: dirName(project), env: { DOTNET_CLI_UI_LANGUAGE: 'en', VSLANG: '1033', DOTNET_NOLOGO: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1' }, timeoutMs: 180000 },
@@ -4223,10 +4242,10 @@ async function deliverPending($: any, e: any, next: any): Promise<any> {
 }
 
 // KI-Fehlerarten: in jeder Code-Datei der neu geschriebene Text (Edit: der neue Teil, Write: alles) auf eingebaute Geheimnisse
-// (FEHLER), Debug-Reste, Merkposten und leere Fänge (Hinweise). Prüfdateien (*.test.*) enthalten solche Stellen absichtlich und
-// fallen weg.
+// und bekannte Sicherheitslücken in C# (FEHLER), Debug-Reste, Merkposten, leere Fänge, async void ohne try und abgeschaltete
+// Prüfsätze (Hinweise). Prüfdateien (*.test.*) enthalten absichtlich schlechte Beispiele: dort zählt nur ein abgeschalteter
+// Prüfsatz (kiBefunde).
 async function kiNote(file: string, e: any): Promise<string | undefined> {
-  if (/\.test\.[cm]?[jt]sx?$/i.test(file)) return undefined
   const parts = [e.content, e.new_string, ...(Array.isArray(e.edits) ? e.edits.map((x: any) => x?.new_string) : [])].filter((x): x is string => typeof x === 'string')
   if (parts.length === 0) return undefined
   const text = parts.join('\n')
@@ -4235,13 +4254,20 @@ async function kiNote(file: string, e: any): Promise<string | undefined> {
   const gekuerzt = text.length > hardeningChecks.kiMaxZeichen && hardeningChecks.kiPruefbar(file)
   if (befunde.length === 0 && !gekuerzt) return undefined
   const geheim = befunde.filter(b => b.art === 'geheimnis').map(b => b.name)
-  const rest = befunde.filter(b => b.art !== 'geheimnis').map(b => b.name)
+  const luecke = befunde.filter(b => b.art === 'sicherheit').map(b => b.name)
+  const rest = befunde.filter(b => b.art !== 'geheimnis' && b.art !== 'sicherheit').map(b => b.name)
   const name = fileName(file)
   const teile: string[] = []
   if (geheim.length > 0) {
     teile.push(t(
       `FEHLER: eingebautes Geheimnis im geschriebenen Text (${geheim.join(', ')}) - sofort entfernen, ein Schlüssel im Quelltext ist veröffentlicht`,
       `ERROR: embedded secret in the written text (${geheim.join(', ')}) - remove it now, a key in source code is a published key`,
+    ))
+  }
+  if (luecke.length > 0) {
+    teile.push(t(
+      `FEHLER: Sicherheitslücke im geschriebenen Text (${luecke.join(', ')}) - sicher lösen, nicht abschalten`,
+      `ERROR: security hole in the written text (${luecke.join(', ')}) - solve it safely, do not switch the check off`,
     ))
   }
   if (rest.length > 0) {

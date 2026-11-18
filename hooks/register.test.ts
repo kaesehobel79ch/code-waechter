@@ -4321,3 +4321,17 @@ test('KI-Fehlerarten: ein Text über der Grenze meldet offen, dass nur der Anfan
   const kurz = await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\klein_ki.py', content: 'x = 1\n' })
   expect((kurz.context ?? []).join('\n')).not.toContain('KI-Fehlerarten')
 })
+
+test('Namen aus einem mit exec eingelesenen Skript: kein Fehler, aber als nicht geprüft genannt', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('process.run', () => ({ value: { ...done, exitCode: 1, stdout: "D:\\t\\e.py:3:1: undefined name 'link'\n" } }))
+  on('fs.read', () => ({ value: 'import os\nexec(open(os.path.join("d", "basis.py")).read())\nlink(1)\n' }))
+
+  const ran = await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\e.py', content: 'x' })
+  const text = (ran.context ?? []).join('\n')
+
+  expect(text).toContain('✔ «e.py»')
+  expect(text).toContain('exec')
+})

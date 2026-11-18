@@ -191,7 +191,47 @@ export function csHardeningHints(text: string, file: string): HardFinding[] {
 // Längere Texte werden nur bis hier geprüft; kiNote sagt das dann offen (ein stiller Teil-Lauf wäre ein "OK" für Ungeprüftes).
 export const KI_MAX_ZEICHEN = 200000
 
-export type KiBefund = { art: 'geheimnis' | 'debug' | 'merkposten' | 'leerer_fang'; name: string }
+export type KiBefund = { art: 'geheimnis' | 'debug' | 'merkposten' | 'leerer_fang' | 'async_void' | 'test_aus' | 'sicherheit'; name: string }
+
+// Sicherheitslücken in C#, die der Prüfbau nicht meldet (gemessen 18.11.2026, .NET 10 mit allen Sicherheitsregeln: abgeschaltete
+// Zertifikatsprüfung bei HttpClientHandler, XmlUrlResolver und DtdProcessing.Parse meldet keine CA-Regel). Python prüft ruff (S),
+// JavaScript die SEC-Regeln.
+const KI_SICHER_CS: [string, RegExp][] = [
+  ['Zertifikatsprüfung abgeschaltet', /DangerousAcceptAnyServerCertificateValidator|(?:ServerCertificateCustomValidationCallback|ServerCertificateValidationCallback|RemoteCertificateValidationCallback)\s*\+?=\s*(?:\([^)]*\)|\w+)\s*=>\s*true\b/],
+  ['unsichere Deserialisierung', /\bnew\s+(?:BinaryFormatter|NetDataContractSerializer|SoapFormatter|LosFormatter)\b|TypeNameHandling\s*=\s*TypeNameHandling\s*\.\s*(?:All|Auto|Objects|Arrays)\b/],
+  ['XML lädt fremde Dateien (XXE)', /DtdProcessing\s*=\s*DtdProcessing\s*\.\s*Parse\b|\bnew\s+XmlUrlResolver\b/],
+]
+
+// Prüfdateien enthalten absichtlich schlechte Beispiele - dort zählt nur ein abgeschalteter Prüfsatz.
+const KI_PRUEFDATEI = /\.test\.[cm]?[jt]sx?$/i
+// Abgeschaltete oder allein gestellte Prüfsätze (Fachleute 2026: KI-Agenten schalten Tests ab, die sie nicht bestehen).
+//
+const KI_TEST_AUS = /\[Ignore\b|\[(?:Fact|Theory|Test)\s*\([^)]*\bSkip\s*=|\b(?:it|test|describe)\s*\.\s*(?:skip|only|todo)\s*\(|\bx(?:it|describe|test)\s*\(|@unittest\s*\.\s*skip|@pytest\s*\.\s*mark\s*\.\s*(?:skip|xfail)/ // code-waechter:ok KI
+const KI_ASYNC_VOID = /\basync\s+void\s+\w+\s*\((?!\s*object\b)/
+
+// "async void" ausserhalb eines Ereignisses (object sender, ...) und ohne try im Rumpf: ein Fehler darin beendet das Programm
+// oder geht verloren.
+function kiAsyncVoidOhneTry(zeilen: string[]): boolean {
+  for (let i = 0; i < zeilen.length; i++) {
+    const z = zeilen[i]
+    const m = KI_ASYNC_VOID.exec(z)
+    if (!m || /\boverride\b/.test(z)) continue
+    const davor = z.slice(0, m.index)
+    if (davor.includes('//') || (davor.split('"').length - 1) % 2 === 1) continue
+    if (z.includes('=>')) { if (!/\btry\b/.test(z)) return true; continue }
+    let tiefe = 0
+    let angefangen = false
+    let geschuetzt = false
+    for (let j = i; j < Math.min(zeilen.length, i + 400); j++) {
+      if (angefangen && /\btry\b/.test(zeilen[j])) { geschuetzt = true; break }
+      tiefe += (zeilen[j].match(/\{/g)?.length ?? 0) - (zeilen[j].match(/\}/g)?.length ?? 0)
+      angefangen = angefangen || zeilen[j].includes('{')
+      if (angefangen && tiefe <= 0) break
+    }
+    if (!geschuetzt) return true
+  }
+  return false
+}
 
 const KI_OK = /code-waechter:ok\s+KI\b/
 
@@ -232,7 +272,9 @@ function kiLeererFang(file: string): RegExp | undefined {
   // Ein Kommentar an "except" oder "pass" ist die Begründung - dann ist der Fang nicht leer.
   if (/\.pyw?$/i.test(file)) return /^\s*except\b[^\n:#]*:[ \t]*\n\s*pass[ \t]*$/m
   if (/\.(?:ps1|psm1)$/i.test(file)) return /\bcatch\s*(?:\[[^\]]*\]\s*)?\{\s*\}/i
-  return /\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/
+  // Auch ein Fang mit Bedingung (when) und leerem Rumpf ist leer (Lücke bis 18.11.2026). Ein Kommentar gleich hinter dem leeren
+  // Rumpf ist die Begründung.
+  return /\bcatch\s*(?:\([^)]*\))?\s*(?:when\s*\([^{}]*\)\s*)?\{\s*\}(?![ \t]*\/\/)/ // code-waechter:ok KI
 }
 
 // Ob die KI-Fehlerarten für diese Datei gelten (Code-Datei nach Endung).
@@ -246,6 +288,16 @@ export function kiBefunde(written: string, file: string): KiBefund[] {
   const text = (written.length > KI_MAX_ZEICHEN ? written.slice(0, KI_MAX_ZEICHEN) : written)
     .split('\n').filter(z => !KI_OK.test(z)).join('\n')
   const befunde: KiBefund[] = []
+  if (text.split('\n').some(z => KI_TEST_AUS.test(z))) befunde.push({ art: 'test_aus', name: 'Prüfsatz abgeschaltet' })
+  if (KI_PRUEFDATEI.test(file)) return befunde
+  if (/\.cs$/i.test(file) && kiAsyncVoidOhneTry(text.split('\n'))) {
+    befunde.push({ art: 'async_void', name: 'async void ohne try (ein Fehler beendet das Programm)' })
+  }
+  if (/\.cs$/i.test(file)) {
+    // Nur der Code vor einem Kommentar: ein Kommentar, der eine Lücke nennt, ist keine.
+    const code = text.split('\n').map(z => { const k = kiKommentar(file, z); return k === undefined ? z : z.slice(0, z.length - k.length) })
+    for (const [name, re] of KI_SICHER_CS) if (code.some(z => re.test(z))) befunde.push({ art: 'sicherheit', name })
+  }
   for (const [name, re] of KI_GEHEIMNISSE) if (re.test(text)) befunde.push({ art: 'geheimnis', name })
   const debug = kiDebugMuster(file)
   if (debug && debug.test(text)) befunde.push({ art: 'debug', name: 'Debug-Ausgabe' })
