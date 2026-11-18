@@ -4307,3 +4307,17 @@ test('Selbstmeldung: dieselbe Datei höchstens dreimal, damit eine unbehebbare M
   }
   expect(auftraege).toBe(3)
 })
+
+test('KI-Fehlerarten: ein Text über der Grenze meldet offen, dass nur der Anfang geprüft wurde', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.exists', () => ({ value: true }))
+  on('process.run', () => ({ value: done }))
+  const gross = 'x = 1\n'.repeat(40000)
+  on('fs.read', () => ({ value: gross }))
+  const lang = await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\gross_ki.py', content: gross })
+  expect((lang.context ?? []).join('\n')).toContain('nur die ersten 200000 von 240000 Zeichen')
+  const kurz = await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\klein_ki.py', content: 'x = 1\n' })
+  expect((kurz.context ?? []).join('\n')).not.toContain('KI-Fehlerarten')
+})

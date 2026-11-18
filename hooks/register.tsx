@@ -4229,8 +4229,11 @@ async function kiNote(file: string, e: any): Promise<string | undefined> {
   if (/\.test\.[cm]?[jt]sx?$/i.test(file)) return undefined
   const parts = [e.content, e.new_string, ...(Array.isArray(e.edits) ? e.edits.map((x: any) => x?.new_string) : [])].filter((x): x is string => typeof x === 'string')
   if (parts.length === 0) return undefined
-  const befunde = hardeningChecks.kiBefunde(parts.join('\n'), file)
-  if (befunde.length === 0) return undefined
+  const text = parts.join('\n')
+  const befunde = hardeningChecks.kiBefunde(text, file)
+  // Über der Grenze wird nur der Anfang geprüft: das wird gesagt, nie still als geprüft durchgelassen.
+  const gekuerzt = text.length > hardeningChecks.kiMaxZeichen && hardeningChecks.kiPruefbar(file)
+  if (befunde.length === 0 && !gekuerzt) return undefined
   const geheim = befunde.filter(b => b.art === 'geheimnis').map(b => b.name)
   const rest = befunde.filter(b => b.art !== 'geheimnis').map(b => b.name)
   const name = fileName(file)
@@ -4243,6 +4246,12 @@ async function kiNote(file: string, e: any): Promise<string | undefined> {
   }
   if (rest.length > 0) {
     teile.push(t(`zu entfernen oder zu begründen: ${rest.join('; ')}`, `remove or justify: ${rest.join('; ')}`))
+  }
+  if (gekuerzt) {
+    teile.push(t(
+      `nicht geprüft: nur die ersten ${hardeningChecks.kiMaxZeichen} von ${text.length} Zeichen wurden auf KI-Fehlerarten geprüft`,
+      `not checked: only the first ${hardeningChecks.kiMaxZeichen} of ${text.length} characters were checked for AI error types`,
+    ))
   }
   return t(
     `${GUARD()} KI-Fehlerarten ${name}: ${teile.join('. ')}. Bewusste Stelle: "code-waechter:ok KI" in der Zeile.`,
@@ -4269,7 +4278,7 @@ async function guarded($: any, e: any, next: any): Promise<any> {
 
 // Überschreitet ein Prüf-Hook seine Zeit (oder bricht er ab), ging das Werkzeug schon durch: dann bekommt Claude wenigstens
 // die Meldung, dass die Datei ungeprüft ist, statt gar nichts. (.catch-Handler: next ist dort wiederholbar, ohne neu zu laufen.)
-async function lostCheck($: any, e: any, next: any): Promise<any> {
+async function lostCheck(_$: any, e: any, next: any): Promise<any> {
   const r = await next(e)
   if (!next.called || r?.deny !== undefined) return r
   return withContext(r, [
@@ -5384,12 +5393,12 @@ export const register: Register = (on, options) => {
         ? { text: await toolsCommand($, String(e.args ?? '')) }
         : e.command === 'waechter-leeren' || e.command === 'code-waechter:waechter-leeren'
           ? { text: await clearDisplay($) }
-          : next(e)).catch((($: any, e: any, next: any) => next(e)) as any)
+          : next(e)).catch(((_$: any, e: any, next: any) => next(e)) as any)
 
   on('turn.complete', autoReport as any)
 
   on('tool.call', (($: any, e: any, next: any) => deliverPending($, e, next)) as any).catch(
-    (($: any, e: any, next: any) => next(e)) as any,
+    ((_$: any, e: any, next: any) => next(e)) as any,
   )
   on('tool.call', { tool: 'Write' }, (($: any, e: any, next: any) => guarded($, e, next)) as any).catch(lostCheck as any)
   on('tool.call', { tool: 'Edit' }, (($: any, e: any, next: any) => guarded($, e, next)) as any).catch(lostCheck as any)

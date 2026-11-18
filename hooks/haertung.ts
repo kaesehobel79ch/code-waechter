@@ -188,6 +188,9 @@ export function csHardeningHints(text: string, file: string): HardFinding[] {
 // Aufruf, hätte sonst jeden Zwischenstand rot - das prüft der Bau am Schluss (Prüfwerkzeug des Projekts).
 // Bewusste Stellen: "code-waechter:ok KI" in derselben Zeile.
 
+// Längere Texte werden nur bis hier geprüft; kiNote sagt das dann offen (ein stiller Teil-Lauf wäre ein "OK" für Ungeprüftes).
+export const KI_MAX_ZEICHEN = 200000
+
 export type KiBefund = { art: 'geheimnis' | 'debug' | 'merkposten' | 'leerer_fang'; name: string }
 
 const KI_OK = /code-waechter:ok\s+KI\b/
@@ -232,10 +235,15 @@ function kiLeererFang(file: string): RegExp | undefined {
   return /\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/
 }
 
+// Ob die KI-Fehlerarten für diese Datei gelten (Code-Datei nach Endung).
+export function kiPruefbar(file: string): boolean {
+  return KI_CODE_DATEI.test(file)
+}
+
 export function kiBefunde(written: string, file: string): KiBefund[] {
-  if (!KI_CODE_DATEI.test(file)) return []
+  if (!kiPruefbar(file)) return []
   // Bewusst markierte Zeilen fallen weg, bevor gesucht wird.
-  const text = (written.length > 200000 ? written.slice(0, 200000) : written)
+  const text = (written.length > KI_MAX_ZEICHEN ? written.slice(0, KI_MAX_ZEICHEN) : written)
     .split('\n').filter(z => !KI_OK.test(z)).join('\n')
   const befunde: KiBefund[] = []
   for (const [name, re] of KI_GEHEIMNISSE) if (re.test(text)) befunde.push({ art: 'geheimnis', name })
@@ -249,4 +257,4 @@ export function kiBefunde(written: string, file: string): KiBefund[] {
   return befunde
 }
 
-export const hardeningChecks = { csHardeningHints, kiBefunde }
+export const hardeningChecks = { csHardeningHints, kiBefunde, kiPruefbar, kiMaxZeichen: KI_MAX_ZEICHEN }
