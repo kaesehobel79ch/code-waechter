@@ -3963,10 +3963,9 @@ async function addToLog($: any, e: Omit<WaechterEntry, 'at' | 'group' | 'fixed'>
       // Windows-Pfade ohne Rücksicht auf Groß-/Kleinschreibung: d:\p\a.cs aus einem Befehl ist dieselbe Datei wie D:\P\a.cs.
       const old = l.find(x => same(x.path, e.path))
       let entry: WaechterEntry = { ...e, at, group: e.group ?? groupFor(e.path) }
-      // Ein Fehler verschwindet nie still: Ist er behoben, steht "behoben" mit dem alten Befund; ließ sich die Datei nicht neu
-      // prüfen, bleibt er als Fehler stehen.
-      if (old?.status === 'fehler' && e.status === 'ok') entry = { ...entry, fixed: true, detail: t(`behoben (vorher: ${old.detail})`, `fixed (before: ${old.detail})`) }
-      else if (old?.status === 'fehler' && e.status === 'ungeprueft') {
+      // Ist ein Fehler behoben, steht die Datei wieder als "in Ordnung" da: die rote Meldung verschwindet aus der Anzeige.
+      // Ließ sich die Datei nicht neu prüfen, bleibt der Fehler stehen.
+      if (old?.status === 'fehler' && e.status === 'ungeprueft') {
         entry = { ...entry, status: 'fehler', detail: t(`Fehler besteht vermutlich noch, Neuprüfung nicht möglich: ${e.detail}`, `error probably still there, re-check not possible: ${e.detail}`) }
       }
       final = entry
@@ -4008,10 +4007,10 @@ async function openReminder($: any, currentPath: string): Promise<string | undef
   return withDataNote([
     t(
       `Code-Wächter ! Noch offen (${open.length}): ${list}${open.length > 5 ? ' …' : ''}. ` +
-        'Bitte prüfen, ob das Problem behoben ist: die Datei beheben und neu schreiben, dann trägt der Wächter "behoben" ein. ' +
+        'Bitte prüfen, ob das Problem behoben ist: die Datei beheben und neu schreiben, dann verschwindet die Meldung. ' +
         'Gibt es die Datei nicht mehr, wird die Meldung gelöscht.',
       `Code Guard ! Still open (${open.length}): ${list}${open.length > 5 ? ' …' : ''}. ` +
-        'Please check whether the problem is fixed: fix the file and write it again, then the guard marks it "fixed". ' +
+        'Please check whether the problem is fixed: fix the file and write it again, then the entry disappears. ' +
         'If the file no longer exists, the entry is removed.',
     ),
   ])
@@ -4029,6 +4028,61 @@ async function clearDisplay($: any): Promise<string> {
     `Code-Wächter: Anzeige geleert (${before} Einträge entfernt). Die Fehlerberichte der Scans bleiben als Dateien erhalten.`,
     `Code Guard: display cleared (${before} entries removed). The scan reports stay as files.`,
   )
+}
+
+// ---- Selbstmeldung: Endet eine Antwort und stehen in der
+// Seitenleiste dieses Chats rote (Fehler) oder gelbe (nicht geprüft) Meldungen, schickt die Mod dem Chat einen Auftrag. Jeder
+// Stand einer Meldung wird nur einmal gemeldet, dieselbe Datei höchstens AUTO_REPORT_MAX-mal je Sitzung: eine Meldung, die
+// sich nicht beheben lässt, erzeugt so keine endlose Schleife.
+export const AUTO_REPORT_MAX = 3
+const reportedOnce = new Set<string>()
+const reportCount = new Map<string, number>()
+
+export function openForReport(log: WaechterEntry[], now: number): WaechterEntry[] {
+  return log.filter(x => (x.status === 'fehler' || x.status === 'ungeprueft') && (now <= 0 || now - x.at < LOG_MAX_AGE_MS))
+}
+
+export function reportText(rows: WaechterEntry[]): string {
+  const red = rows.filter(x => x.status === 'fehler')
+  const yellow = rows.filter(x => x.status !== 'fehler')
+  const line = (x: WaechterEntry) => `- ${x.kind === 'Scan' ? `Scan ${daten(x.group, 60)}: ` : ''}${daten(x.file === SCAN_TOTAL ? t('Gesamt', 'Total') : x.file, 80)} (${daten(x.path, 160)}): ${clip(x.detail, 200)}`
+  return withDataNote([
+    t(
+      `Code-Wächter: In der Seitenleiste stehen ${red.length} rote und ${yellow.length} gelbe Meldungen offen.`,
+      `Code Guard: the sidebar shows ${red.length} red and ${yellow.length} yellow open entries.`,
+    ),
+    ...(red.length > 0 ? [t('Rot (Fehler):', 'Red (errors):'), ...red.map(line)] : []),
+    ...(yellow.length > 0 ? [t('Gelb (nicht oder nur teilweise geprüft):', 'Yellow (not or only partly checked):'), ...yellow.map(line)] : []),
+    t(
+      'Bitte jede selbst beheben und die Datei danach neu schreiben (bei einem Scan den Scan neu laufen lassen); was behoben ist, ' +
+        'verschwindet aus der Anzeige. Lässt sich eine Meldung nicht beheben, dem Benutzer in einem Satz den Grund sagen.',
+      'Please fix each one and write the file again afterwards (for a scan, run the scan again); fixed entries disappear from the ' +
+        'display. If an entry cannot be fixed, tell the user the reason in one sentence.',
+    ),
+  ])
+}
+
+// Was von diesen offenen Meldungen jetzt gemeldet wird (merkt sich das Gemeldete).
+export function takeForReport(rows: WaechterEntry[]): WaechterEntry[] {
+  const take = rows.filter(x => !reportedOnce.has(`${x.path}|${x.at}`) && (reportCount.get(x.path.toLowerCase()) ?? 0) < AUTO_REPORT_MAX)
+  for (const x of take) {
+    reportedOnce.add(`${x.path}|${x.at}`)
+    reportCount.set(x.path.toLowerCase(), (reportCount.get(x.path.toLowerCase()) ?? 0) + 1)
+  }
+  return take
+}
+
+async function autoReport($: any, e: any, next: any): Promise<any> {
+  const ran = await next(e)
+  // Nur nach einer fertigen Antwort des Chats selbst (nicht eines Helfers, nicht nach einem Abbruch).
+  if (e.agentId !== undefined || e.reason !== 'answer') return ran
+  try {
+    const rows = takeForReport(openForReport(await read($, logAtom), await $.clock.now()))
+    if (rows.length > 0) void safe($.prompt.submit({ text: reportText(rows) }))
+  } catch {
+    // Die Selbstmeldung darf die Antwort nie stören.
+  }
+  return ran
 }
 
 // Eine Prüfung samt Anzeige. Die Anzeige wird auch bei einem Fehler unterwegs zurückgesetzt.
@@ -5302,6 +5356,8 @@ export const register: Register = (on, options) => {
         : e.command === 'waechter-leeren' || e.command === 'code-waechter:waechter-leeren'
           ? { text: await clearDisplay($) }
           : next(e)).catch((($: any, e: any, next: any) => next(e)) as any)
+
+  on('turn.complete', autoReport as any)
 
   on('tool.call', (($: any, e: any, next: any) => deliverPending($, e, next)) as any).catch(
     (($: any, e: any, next: any) => next(e)) as any,

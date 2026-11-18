@@ -4244,3 +4244,66 @@ test('Härtung HTML: eine Datei mit vielen "on..." ohne "<" bleibt schnell; "onc
   expect(ms).toBeLessThan(5000)
   expect(imWert).not.toContain('SEC-EVAL')
 })
+
+test('Selbstmeldung: nach der Antwort meldet der Wächter offene rote Meldungen dem Chat, einmal; behoben verschwindet die Meldung', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.exists', () => ({ value: true }))
+  let kaputt = true
+  on('process.run', (_$, e) => ({
+    value: kaputt && String(e.argv[e.argv.length - 1]).endsWith('auto_bad.py') ? { ...done, exitCode: 1, stdout: "D:\\t\\auto_bad.py:1:1: undefined name 'q'\n" } : done,
+  }))
+  on('fs.read', () => ({ value: 'q\n' }))
+  on('turn.complete', () => ({ text: 'fertig' }))
+  const auftraege: string[] = []
+  on('prompt.submit', (_$, e) => {
+    auftraege.push(e.text)
+    return { text: e.text }
+  })
+  const ende = (reason: 'answer' | 'aborted') => $.turn.complete({ answer: 'fertig', durationMs: 1, isAborted: reason === 'aborted', turnId: 't', reason } as never)
+
+  await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\auto_bad.py', content: 'x' })
+  // Abbruch durch den Benutzer: keine Meldung
+  await ende('aborted')
+  expect(auftraege.length).toBe(0)
+  await ende('answer')
+  expect(auftraege.length).toBe(1)
+  expect(auftraege[0]).toContain('1 rote und 0 gelbe')
+  expect(auftraege[0]).toContain('«auto_bad.py»')
+  // Derselbe Stand wird nicht zweimal gemeldet
+  await ende('answer')
+  expect(auftraege.length).toBe(1)
+
+  // Behoben: die Datei steht wieder als in Ordnung da, ohne "behoben"-Zeile; nichts mehr zu melden
+  kaputt = false
+  const fix = await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\auto_bad.py', content: 'x' })
+  expect((fix.context ?? []).join('\n')).toContain('✔ «auto_bad.py»')
+  const ui = await $.ui.mount({ plugin: 'code-waechter', component: 'Pane', requestId: 'code-waechter', surface: 'desktop', props: {} } as never)
+  expect(await ui.find({ type: 'Text', text: /behoben/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /Offene Fehler/ })).toBe(undefined)
+  await ui.unmount()
+  await ende('answer')
+  expect(auftraege.length).toBe(1)
+})
+
+test('Selbstmeldung: dieselbe Datei höchstens dreimal, damit eine unbehebbare Meldung keine Schleife macht', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  const uhr = mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.exists', () => ({ value: true }))
+  on('process.run', () => ({ value: { ...done, exitCode: 1, stdout: "D:\\t\\stur.py:1:1: undefined name 'q'\n" } }))
+  on('fs.read', () => ({ value: 'q\n' }))
+  on('turn.complete', () => ({ text: 'fertig' }))
+  let auftraege = 0
+  on('prompt.submit', (_$, e) => {
+    auftraege++
+    return { text: e.text }
+  })
+  for (let i = 0; i < 5; i++) {
+    await $.tool.call({ tool: 'Write', file_path: 'D:\\t\\stur.py', content: 'x' })
+    await $.turn.complete({ answer: 'fertig', durationMs: 1, isAborted: false, turnId: `t${i}`, reason: 'answer' } as never)
+    await uhr.advance(1000)
+  }
+  expect(auftraege).toBe(3)
+})
