@@ -4469,3 +4469,119 @@ test('Sicherheits-Scanner: ein roter Bandit-Fund bleibt rot, auch wenn Ruff dies
   expect(text).toContain('✖ «b.py»')
   expect(text).toContain('B602')
 })
+
+// ====================================================================================== Binärdateien
+// Binärdateien werden nicht geprüft. Eine Datei mit einem Nullbyte in den ersten 8000 Bytes ist keine Textdatei
+// (ausser mit der Kennung von UTF-16/UTF-32 am Anfang). Anlass: ein Spielmodell mit der Endung .mesh (Kopf "hsem", viele Nullbytes)
+// wurde als GLSL-Mesh-Shader übersetzt und rot gemeldet. Die Bytes kommen hier wie vom echten Lesezugriff als { base64 }.
+const zeichen = (s: string): number[] => [...s].map(c => c.charCodeAt(0))
+const alsBytes = (b: number[]) => ({ base64: (new Uint8Array(b) as any).toBase64() as string })
+const MODELL = [...zeichen('hsem'), 6, 0, 0, 0, 0, 0, 0, 0, ...zeichen(' -1,0c, '), 0, 0, 0x80, 0x3f]
+const BREIT = (s: string): number[] => [...s].flatMap(c => [c.charCodeAt(0), 0]) // UTF-16 LE ohne Kennung
+
+function bytePlatte(on: On, projects: string, dateien: Record<string, number[]>) {
+  on('env.get', (_$, e) => ({ value: e.name === 'TEMP' ? 'C:\\Temp' : e.name === 'USERPROFILE' ? 'C:\\Users\\Probe' : undefined }))
+  on('fs.read', (_$, e) => {
+    if (e.path.endsWith('Projekte.txt')) return { value: projects }
+    const b = dateien[e.path]
+    if (b === undefined) return { deny: 'Datei nicht da' } as never
+    return { value: (e.as === 'bytes' ? alsBytes(b.slice(e.offset ?? 0, (e.offset ?? 0) + (e.length ?? b.length))) : String.fromCharCode(...b)) as never }
+  })
+}
+
+// Welche .py-, .mesh- und .ps1-Dateien ein Prüfprogramm bekam (als Argument oder, wie bei PowerShell, in CW_FILE); jede gilt als
+// fehlerfrei.
+function byteLaeufe(on: On): string[] {
+  const geprueft: string[] = []
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: '20.11.2026 18:00:00,00\r\n' } }
+    const env = ((e as { init?: { env?: Record<string, unknown> } }).init?.env ?? {}) as Record<string, unknown>
+    for (const x of [...a, String(env.CW_FILE ?? '')]) if (/\.(py|mesh|ps1)$/i.test(x)) geprueft.push(x)
+    return { value: done }
+  })
+  return geprueft
+}
+
+test('Binärdatei mit Quelltext-Endung wird beim Schreiben nicht geprüft; dieselbe Endung als Text wird geprüft (Gegenprobe)', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  bytePlatte(on, '', { 'D:\\p\\modell.py': MODELL, 'D:\\p\\echt.py': zeichen('x = 1\n') })
+  const geprueft = byteLaeufe(on)
+
+  const bin = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\modell.py', content: 'x' })).context ?? []).join('\n')
+  expect(bin).toContain('Code-Wächter – «modell.py»: Binärdatei (Nullbytes, keine Textdatei), nicht geprüft.')
+  expect(geprueft.some(f => /modell\.py$/i.test(f))).toBe(false)
+
+  const txt = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\echt.py', content: 'x' })).context ?? []).join('\n')
+  expect(txt).not.toContain('Binärdatei')
+  expect(geprueft.some(f => /echt\.py$/i.test(f))).toBe(true)
+})
+
+test('Binärdatei: UTF-16 mit Kennung FF FE ist Text und wird geprüft; ohne Kennung zählt sie als Binärdatei (Gegenprobe)', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  bytePlatte(on, '', { 'D:\\p\\breit.ps1': [0xff, 0xfe, ...BREIT('$x = 1\r\n')], 'D:\\p\\ohne.ps1': BREIT('$x = 1\r\n') })
+  const geprueft = byteLaeufe(on)
+
+  const breit = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\breit.ps1', content: 'x' })).context ?? []).join('\n')
+  expect(breit).not.toContain('Binärdatei')
+  expect(geprueft.some(f => /breit\.ps1$/i.test(f))).toBe(true)
+
+  const ohne = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\ohne.ps1', content: 'x' })).context ?? []).join('\n')
+  expect(ohne).toContain('Binärdatei')
+  expect(geprueft.some(f => /ohne\.ps1$/i.test(f))).toBe(false)
+})
+
+test('/scan übergeht Binärdateien und NuGet-Pakete, nennt die Binärdateien im Bericht; eigene Pakete bleiben geprüft (Gegenprobe)', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  bytePlatte(on, 'Binaer | D:\\bp |\n', {
+    'D:\\bp\\Modell.mesh': MODELL,
+    'D:\\bp\\a.py': zeichen('x = 1\n'),
+    'D:\\bp\\packages\\Newtonsoft.Json.13.0.3\\install.py': zeichen('x = 1\n'),
+    'D:\\bp\\Packages\\com.firma.paket\\eigen.py': zeichen('x = 1\n'),
+  })
+  const listed: string[] = []
+  on('fs.list', (_$, e) => {
+    listed.push(e.path)
+    const v: Record<string, unknown[]> = {
+      'D:\\bp': [fileEntry('Modell.mesh'), fileEntry('a.py'), dirEntry('packages'), dirEntry('Packages')],
+      'D:\\bp\\packages': [dirEntry('Newtonsoft.Json.13.0.3')],
+      'D:\\bp\\packages\\Newtonsoft.Json.13.0.3': [fileEntry('install.py')],
+      'D:\\bp\\Packages': [dirEntry('com.firma.paket')],
+      'D:\\bp\\Packages\\com.firma.paket': [fileEntry('eigen.py')],
+    }
+    return { value: (v[e.path] ?? []) as never }
+  })
+  const writes: { path: string; text: string }[] = []
+  on('fs.write', (_$, e) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
+  const geprueft = byteLaeufe(on)
+  on('session.send', () => ({ isDelivered: true }))
+  on('ui.toast', () => ({ value: undefined }))
+
+  await $.command.run({ command: 'scan', args: 'Binaer' } as never)
+  const result = await scanResult($, 'Scan Binaer')
+  const report = writes.find(w => w.path.endsWith('Binaer_Fehlerbericht.txt'))?.text ?? ''
+
+  expect(geprueft.some(f => /Modell\.mesh$/i.test(f))).toBe(false)
+  expect(report).toContain('Übergangen: 1 Binärdatei (keine Textdateien, Liste unten)')
+  expect(report).toContain('ÜBERGANGEN: BINÄRDATEIEN')
+  expect(report).toContain('«Modell.mesh»')
+  expect(result).toContain('Übergangen: 1 Binärdatei (Liste im Bericht)')
+  expect(result).toContain('keine Fehler')
+  // NuGet-Ablage: nicht gelesen, nicht geprüft. Eigenes Paket und die Textdatei daneben: geprüft.
+  expect(listed).not.toContain('D:\\bp\\packages\\Newtonsoft.Json.13.0.3')
+  expect(geprueft.some(f => /install\.py$/i.test(f))).toBe(false)
+  expect(geprueft.some(f => /eigen\.py$/i.test(f))).toBe(true)
+  expect(geprueft.some(f => /\\a\.py$/i.test(f))).toBe(true)
+  // Seitenleiste: keine Zeile für die Binärdatei und keine Dateiart "Shader" (die einzige .mesh war binär).
+  const ui = await $.ui.mount({ plugin: 'code-waechter', component: 'Pane', requestId: 'code-waechter', surface: 'desktop', props: {} } as never)
+  expect(await ui.find({ type: 'Text', text: /Modell\.mesh/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /Shader/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /Python/ })).not.toBe(undefined)
+  await ui.unmount()
+})
