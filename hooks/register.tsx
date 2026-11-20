@@ -317,11 +317,9 @@ function tsLangOf(file: string): TsLang | undefined {
 
 // Dateien, die nur Erzeugnisse sind: nie prüfen.
 // bin nur als Ausgabeordner eines Projekts (bin\Debug, bin\Release, bin\x64 ...) und Library nur mit Unitys Zwischenordnern: ein eigener
-// Ordner "bin" oder "Library" mit echten Skripten wird weiter geprüft. Ebenso packages nur als NuGet-Ablage älterer .NET-Projekte
-// (packages\<Paket>.<Fassung>\, z. B. packages\Newtonsoft.Json.13.0.3\: fremder Code); Unitys Ordner Packages mit eigenen Paketen
-// (Packages\com.firma.paket\, ohne Fassungsnummer) bleibt geprüft.
+// Ordner "bin" oder "Library" mit echten Skripten wird weiter geprüft.
 const SKIP =
-  /[\\/](obj|node_modules|\.git|\.vs|PackageCache)[\\/]|[\\/]bin[\\/](Debug|Release|x64|x86|net[\w.-]*)[\\/]|[\\/]Library[\\/](Bee|ScriptAssemblies|Artifacts|il2cpp_cache|StateCache|ShaderCache|PackageCache)[\\/]|[\\/]packages[\\/][^\\/]+?\.\d+\.\d+[^\\/]*[\\/]|[\\/]\.claude-plugin[\\/]types[\\/]/i
+  /[\\/](obj|node_modules|\.git|\.vs|PackageCache)[\\/]|[\\/]bin[\\/](Debug|Release|x64|x86|net[\w.-]*)[\\/]|[\\/]Library[\\/](Bee|ScriptAssemblies|Artifacts|il2cpp_cache|StateCache|ShaderCache|PackageCache)[\\/]|[\\/]\.claude-plugin[\\/]types[\\/]/i
 
 // Hilfsprojekt des WPF-Markup-Übersetzers (Name_xxxx_wpftmp.csproj): bleibt nach einem abgebrochenen Bau neben dem echten Projekt
 // liegen. Übersetzt ergibt es Hunderte Fehler "doppelt definiert", die keine sind: nie als Projekt nehmen.
@@ -3498,32 +3496,6 @@ async function readText($: any, file: string): Promise<string | undefined> {
   }
 }
 
-// ====================================================================================== Binärdateien
-// Eine Datei mit einem Nullbyte in den ersten 8000 Bytes ist keine Textdatei (dieselbe Regel wie bei Git), ausser sie beginnt mit der
-// Kennung von UTF-16 oder UTF-32: dort gehören Nullbytes zu jedem Zeichen. Solche Dateien prüft der Wächter nicht, auch wenn ihre
-// Endung die einer Quelltextart ist. Anlass: ein Spielmodell mit der Endung .mesh (Kopf "hsem", fast die Hälfte der ersten 4096 Bytes
-// Nullbytes) hat die Endung von GLSL-Mesh-Shadern; glslang meldete zwei Fehler, die keine waren. Ebenso gespeicherte
-// Unity-Einstellungen (Library\*.asset) und Spieldateien mit fremden Endungen.
-const BINARY_PROBE = 8000
-
-async function isBinary($: any, file: string): Promise<boolean> {
-  let r: unknown
-  try {
-    r = await $.fs.read(file, { as: 'bytes', offset: 0, length: BINARY_PROBE })
-  } catch {
-    // Nicht lesbar: dann entscheidet die Prüfung der Dateiart selbst und meldet es offen ("nicht lesbar", "nicht geprüft").
-    return false
-  }
-  // Antwortet der Lesezugriff mit Text statt mit Bytes, gilt dieselbe Regel für die Zeichen.
-  if (typeof r === 'string') return !/^[\uFEFF\uFFFE]/.test(r) && r.slice(0, BINARY_PROBE).includes('\u0000')
-  const b64 = (r as { base64?: unknown } | null)?.base64
-  if (typeof b64 !== 'string') return false
-  const bytes: Uint8Array = (Uint8Array as any).fromBase64(b64)
-  const bom = (...k: number[]): boolean => k.every((v, i) => bytes[i] === v)
-  if (bom(0xff, 0xfe) || bom(0xfe, 0xff) || bom(0x00, 0x00, 0xfe, 0xff)) return false // UTF-16 LE/BE, UTF-32 LE (FF FE 00 00) und BE
-  return bytes.includes(0)
-}
-
 // ====================================================================================== Große Dateien lesen
 // $.fs.read liest höchstens 4 MiB je Aufruf (Schnittstelle von Claude Code). Größere Dateien teilt ein PowerShell-Aufruf an
 // Zeilenenden (eine längere Zeile an einer UTF-8-Zeichengrenze) in Stücke von höchstens 3 MiB; die Mod liest die Stücke und setzt
@@ -4295,12 +4267,6 @@ async function checkOne($: any, file0: string): Promise<string | undefined> {
   const kinds = kindsOf(file)
   if (!kinds || SKIP.test(file)) return undefined
   const name = fileName(file)
-  // Binärdatei mit der Endung einer Quelltextart: nicht prüfen und keine Zeile in der Seitenleiste; Claude erfährt es trotzdem.
-  if (await isBinary($, file)) {
-    return withDataNote([
-      t(`Code-Wächter – ${name}: Binärdatei (Nullbytes, keine Textdatei), nicht geprüft.`, `Code Guard – ${name}: binary file (null bytes, not a text file), not checked.`),
-    ])
-  }
   // Die Chat-Kennung vor der Abfrage von busy holen: Zwischen "busy" und queue.push darf kein await liegen, sonst endet die
   // laufende Prüfung in der Pause, findet die Warteliste leer, und der Eintrag bliebe danach liegen.
   const sid = await sidOf($)
@@ -4752,7 +4718,6 @@ async function writeReport(
   dropped = 0,
   omitted: string[] = [],
   links: string[] = [],
-  binaries: string[] = [],
 ): Promise<string> {
   const rel = (p: string): string => (norm(p).toLowerCase().startsWith(`${target.dir.toLowerCase()}\\`) ? norm(p).slice(target.dir.length + 1) : norm(p))
   const files = new Set(problems.map(p => norm(p.file).toLowerCase()))
@@ -4765,7 +4730,6 @@ async function writeReport(
     `${t('Geprüft: ', 'Checked: ')} ${countText(count)}`,
     ...(limited.length > 0 ? [t(`Nur eingeschränkt geprüft: ${limited.length} Dateien (Liste unten)`, `Only partly checked: ${limited.length} files (list below)`)] : []),
     ...(skipped.length > 0 ? [t(`Nicht geprüft: ${skipped.length} Dateien (Liste unten)`, `Not checked: ${skipped.length} files (list below)`)] : []),
-    ...(binaries.length > 0 ? [t(`Übergangen: ${plural(binaries.length, 'Binärdatei', 'Binärdateien')} (keine Textdateien, Liste unten)`, `Passed over: ${plural(binaries.length, 'binary file', 'binary files')} (not text files, list below)`)] : []),
     ...(omitted.length > 0
       ? [
           t(
@@ -4824,12 +4788,6 @@ async function writeReport(
     for (const s of skipped) lines.push(`${daten(rel(s.file), 200)}: ${clip(s.reason, 200)}`)
     lines.push('')
   }
-  if (binaries.length > 0) {
-    lines.push(t('ÜBERGANGEN: BINÄRDATEIEN (Nullbytes, keine Textdateien; geprüft wird nur Quelltext)', 'PASSED OVER: BINARY FILES (null bytes, not text files; only source text is checked)'), '')
-    for (const b of binaries.slice(0, MAX_REPORTED)) lines.push(daten(rel(b), 200))
-    if (binaries.length > MAX_REPORTED) lines.push(t(`… und ${binaries.length - MAX_REPORTED} weitere.`, `… and ${binaries.length - MAX_REPORTED} more.`))
-    lines.push('')
-  }
   const file = `${await ablage($)}\\Fehlerberichte\\${reportName(target, (await readProjects($)).list)}`
   await $.fs.write(file, lines.join('\r\n'))
   return file
@@ -4872,7 +4830,6 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
   const problems: ScanProblem[] = []
   const skipped: ScanSkipped[] = []
   const limited: ScanLimited[] = []
-  const binaries: string[] = [] // Binärdateien mit der Endung einer Quelltextart: übergangen, im Bericht genannt
   const seen = new Set<string>()
   const firstOf = new Map<string, ScanProblem>() // Datei -> erster Fehler
   const perFile = new Map<string, number>()
@@ -4968,10 +4925,6 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
         if (x.status === 'fehler') x.mine.forEach(add)
         continue
       }
-      if (await isBinary($, file)) {
-        binaries.push(file)
-        continue
-      }
       let kinds = (kindsFor(file) ?? []).filter(k => k !== 'dotnet')
       let o: Outcome | undefined
       // VB.NET und F#: steht die Datei in der Dateiliste eines eben übersetzten Projekts, ist sie geprüft. Hat der Scan ihr Projekt schon
@@ -5040,7 +4993,7 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
     for (const f of await duplicateGuids($, files.filter(f => processed.has(norm(f).toLowerCase())))) add(f)
     const seconds = ((await $.clock.now()) - t0) / 1000
     const cut: CutReason[] = [...(limit ? [limit] : []), ...(timedOut ? (['time'] as const) : [])]
-    const report = await writeReport($, target, problems, skipped, limited, count, cut, seconds, dropped, omitted, links, binaries)
+    const report = await writeReport($, target, problems, skipped, limited, count, cut, seconds, dropped, omitted, links)
     const fileCount = firstOf.size
     const problemCount = problems.length + dropped
     // Nie "keine Fehler" ohne den Hinweis, dass der Scan nicht alles erreicht hat.
@@ -5065,8 +5018,6 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
       omitted.length > 0
         ? t(` Ausgelassen: ${omitted.length} Ordner mit .code-guard-skip oder .code-waechter-auslassen (Liste im Bericht).`, ` Skipped: ${omitted.length} folders with .code-guard-skip or .code-waechter-auslassen (list in the report).`)
         : ''
-    const binNote =
-      binaries.length > 0 ? t(` Übergangen: ${plural(binaries.length, 'Binärdatei', 'Binärdateien')} (Liste im Bericht).`, ` Passed over: ${plural(binaries.length, 'binary file', 'binary files')} (list in the report).`) : ''
     // Name und Ordner können aus dem Projekt stammen (gefundener Ordnername): in «…», auch in der Nachricht an einen anderen Chat.
     const nm = daten(target.name, 80)
     const dr = daten(target.dir, 200)
@@ -5084,7 +5035,7 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
         : t(
             `Code-Wächter Scan ${nm}: keine Fehler in den geprüften Dateien. Geprüft: ${countText(count)}${skipped.length > 0 ? `, ${skipped.length} nicht geprüft` : ''}. Bericht: ${rp}`,
             `Code Guard scan ${nm}: no errors in the checked files. Checked: ${countText(count)}${skipped.length > 0 ? `, ${skipped.length} not checked` : ''}. Report: ${rp}`,
-          )) + incomplete + skipNote + binNote
+          )) + incomplete + skipNote
     let delivery = ''
     if (problemCount > 0 && target.leader.length > 0) {
       // Nur Zahlen und der Ort des Berichts: Dateinamen und Meldungen eines Projekts gehen nie als Text in einen anderen Chat.
@@ -5108,11 +5059,9 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
     // "eingeschränkt" (z. B. C# nur Syntax) zählt nie als "in Ordnung".
     const skippedFiles = new Set(skipped.map(s => norm(s.file).toLowerCase()))
     const limitedFiles = new Set(limited.map(s => norm(s.file).toLowerCase()))
-    const binaryFiles = new Set(binaries.map(b => norm(b).toLowerCase()))
     const tally = new Map<string, { ok: number; bad: number; open: number; part: number; first: string }>()
     for (const f of files) {
       const key = norm(f).toLowerCase()
-      if (binaryFiles.has(key)) continue // keine Textdatei: zählt in keiner Dateiart (steht im Bericht)
       const g = langGroup(f)
       const row = tally.get(g) ?? { ok: 0, bad: 0, open: 0, part: 0, first: '' }
       const p = firstOf.get(key)
@@ -5141,8 +5090,8 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
             : truncated || timedOut
             ? t(`${fileSum(count)} Dateien ohne Fehler, Scan unvollständig`, `${fileSum(count)} files without errors, scan incomplete`)
             : t(
-                `${fileSum(count)} Dateien in ${Math.round(seconds)} s geprüft${limited.length > 0 ? `, ${limited.length} nur eingeschränkt` : ''}${links.length > 0 ? `, ${links.length} Verknüpfungen nicht verfolgt` : ''}${omitted.length > 0 ? `, ${omitted.length} Ordner ausgelassen` : ''}${binaries.length > 0 ? `, ${plural(binaries.length, 'Binärdatei', 'Binärdateien')} übergangen` : ''}`,
-                `${fileSum(count)} files checked in ${Math.round(seconds)} s${limited.length > 0 ? `, ${limited.length} only partly` : ''}${links.length > 0 ? `, ${links.length} links not followed` : ''}${omitted.length > 0 ? `, ${omitted.length} folders skipped` : ''}${binaries.length > 0 ? `, ${plural(binaries.length, 'binary file', 'binary files')} passed over` : ''}`,
+                `${fileSum(count)} Dateien in ${Math.round(seconds)} s geprüft${limited.length > 0 ? `, ${limited.length} nur eingeschränkt` : ''}${links.length > 0 ? `, ${links.length} Verknüpfungen nicht verfolgt` : ''}${omitted.length > 0 ? `, ${omitted.length} Ordner ausgelassen` : ''}`,
+                `${fileSum(count)} files checked in ${Math.round(seconds)} s${limited.length > 0 ? `, ${limited.length} only partly` : ''}${links.length > 0 ? `, ${links.length} links not followed` : ''}${omitted.length > 0 ? `, ${omitted.length} folders skipped` : ''}`,
               ),
       ms: seconds * 1000,
     })

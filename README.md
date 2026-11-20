@@ -67,7 +67,7 @@ Fehlt ein Prüfprogramm, heißt es offen **NICHT GEPRÜFT** mit Grund, nie ein f
 Name | Ordner | Projektleiter-Chat
 ```
 
-Der Projektleiter-Chat ist freiwillig: Läuft ein Chat mit diesem Namen, bekommt er die gefundenen Fehler als Nachricht. Ordner mit einer Datei `.code-waechter-auslassen` oder `.code-guard-skip` lässt der Scan samt Unterordnern aus (z. B. heruntergeladene Programme); der Bericht nennt jeden ausgelassenen Ordner. Binärdateien (ein Nullbyte in den ersten 8000 Bytes, z. B. ein Spielmodell mit der Endung eines Shaders) und NuGet-Ablagen `packages\<Paket>.<Fassung>` prüft der Wächter nicht; der Bericht nennt die übergangenen Binärdateien.
+Der Projektleiter-Chat ist freiwillig: Läuft ein Chat mit diesem Namen, bekommt er die gefundenen Fehler als Nachricht. Ordner mit einer Datei `.code-waechter-auslassen` oder `.code-guard-skip` lässt der Scan samt Unterordnern aus (z. B. heruntergeladene Programme); der Bericht nennt jeden ausgelassenen Ordner.
 
 ## Einstellungen
 
@@ -141,7 +141,7 @@ It covers C#/.NET and XAML (including mistakes that only crash at run time, such
 
 **Security:** anything that could run a project's code (building, `perl -c`, PHPStan, project scripts) runs only in folders you trust (setting "Trusted folders"); elsewhere only the syntax is checked. A project is not built either if MSBuild would read a build settings file above it (`Directory.Build.props`/`.targets`, `global.json` …) from outside the trusted folders. Programs are started by full path only, never from the project folder. File content shown in messages (file and folder names included) is sanitised and marked as data; secrets found are never repeated in clear text, not even in checker messages; errors in included files outside the project folder are shown without their text. `/scan` always names skipped folders and links it did not follow. `/waechter-werkzeuge install all` downloads checkers straight from the vendor, pinned version and SHA-256 checksum, no installation, no package scripts.
 
-**Commands:** `/waechter` (sidebar), `/waechter-leeren` (clear the sidebar, reports stay), `/scan <project | all | folder | file>`, `/waechter-werkzeuge [install <name> | install all]`. Projects for `/scan` are listed in `Projekte.txt` (one line per project: `name | folder | lead chat`). Folders containing `.code-guard-skip` are skipped. Binary files (a null byte in the first 8000 bytes, e.g. a game model with a shader extension) and NuGet folders `packages\<name>.<version>` are not checked; the report lists the binary files passed over. Messages are in German or English (setting "Language": auto, de, en).
+**Commands:** `/waechter` (sidebar), `/waechter-leeren` (clear the sidebar, reports stay), `/scan <project | all | folder | file>`, `/waechter-werkzeuge [install <name> | install all]`. Projects for `/scan` are listed in `Projekte.txt` (one line per project: `name | folder | lead chat`). Folders containing `.code-guard-skip` are skipped. Messages are in German or English (setting "Language": auto, de, en).
 
 **Requirements:** Windows 10 or 11 (64-bit); Claude Code in the terminal, the desktop app (Code tab) or VS Code – not the claude.ai chat or cloud sessions; Python (e.g. the `py` launcher) for Python, XML, JSON, YAML, HTML, CSS, SQL and for installing the language packages; the .NET SDK, Visual Studio with C++ or the Windows SDK for the languages that use them. Missing checkers are installed with `/waechter-werkzeuge`; anything missing is reported openly as "not checked".
 
