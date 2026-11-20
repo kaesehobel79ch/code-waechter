@@ -13,6 +13,8 @@ const VERTRAUT = { options: { freigegebene_ordner: 'D:\\', sprache: 'de', werkze
 // Die Mod liest den Temp-Ordner aus TEMP; ohne ihn bricht sie offen ab (sie weicht nie auf einen fremden Ordner aus).
 const withTemp = (on: On) => on('env.get', (_$, e) => ({ value: e.name === 'TEMP' ? 'C:\\Temp' : undefined }))
 
+// Aufrufe der Sicherheits-Scanner (sicherheit.ts), die nach jeder Prüfung laufen
+const SCANNER_LAUF = (argv: readonly string[]): boolean => /\b(?:devskim|cppcheck|gitleaks)\b/i.test(String(argv[0] ?? '')) || argv.includes('bandit')
 const done = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 const toolAnswer = { result: {}, text: 'ok' }
 const projectList = [{ name: 'Mod.csproj', kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false }]
@@ -60,6 +62,7 @@ test('C#-Syntaxprüfung verlangt volle Pfade, sonst gilt der eigene Fehler als F
   let cscArgs: readonly string[] = []
   on('process.run', (_$, e) => {
     if (e.argv[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (SCANNER_LAUF(e.argv)) return { value: done } // die Sicherheits-Scanner laufen danach; hier zählt nur der Übersetzer
     cscArgs = e.argv
     return { value: { ...done, exitCode: 1, stdout: "D:\\u\\U.cs(3,13): error CS1525: Invalid expression term ';'\r\n" } }
   })
@@ -80,6 +83,7 @@ test('C#-Syntaxprüfung verlangt UTF-8-Ausgabe und englische Meldungen', VERTRAU
   let cscArgs: readonly string[] = []
   on('process.run', (_$, e) => {
     if (e.argv[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (SCANNER_LAUF(e.argv)) return { value: done } // die Sicherheits-Scanner laufen danach; hier zählt nur der Übersetzer
     cscArgs = e.argv
     return { value: { ...done, exitCode: 1, stdout: "D:\\u\\U.cs(3,13): error CS1525: Invalid expression term ';'\r\n" } }
   })
@@ -152,6 +156,7 @@ test('C++: cl.exe läuft im Ordner der Datei und bekommt nur den Dateinamen (Pfa
   let call: { argv: readonly string[]; cwd?: string; env?: Record<string, string> } | undefined
   on('process.run', (_$, e) => {
     if (e.argv[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (SCANNER_LAUF(e.argv)) return { value: done } // die Sicherheits-Scanner laufen danach; hier zählt nur der Übersetzer
     call = { argv: e.argv, cwd: e.init?.cwd, env: e.init?.env }
     return { value: { ...done, exitCode: 2, stdout: "kaputt.cpp\r\nkaputt.cpp(1): error C2143: syntax error: missing ';' before '}'\r\n" } }
   })
@@ -4334,4 +4339,133 @@ test('Namen aus einem mit exec eingelesenen Skript: kein Fehler, aber als nicht 
 
   expect(text).toContain('✔ «e.py»')
   expect(text).toContain('exec')
+})
+
+// Sicherheits-Scanner nach dem Schreiben (sicherheit.ts): eine kleine Festplatte im Speicher, die Scanner gespielt.
+function platte(on: On, inhalt: Record<string, string>) {
+  on('env.get', (_$, e) => ({ value: e.name === 'TEMP' ? 'C:\\Temp' : e.name === 'USERPROFILE' ? 'C:\\Users\\probe' : undefined }))
+  on('fs.write', (_$, e) => {
+    inhalt[e.path] = String(e.text)
+    return { value: undefined }
+  })
+  on('fs.read', (_$, e) => (e.path in inhalt ? { value: inhalt[e.path] } : { deny: 'Datei nicht da' }) as never)
+  return inhalt
+}
+
+test('Sicherheits-Scanner: C# mit UnpatchAll() wird rot, DevSkim-Hinweis und Fund stehen im Sammelbericht', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  sdkOnly(on)
+  const d = platte(on, { 'D:\\m\\Patch.cs': 'using HarmonyLib;\nclass M {\n  void Aus() { harmony.UnpatchAll(); }\n}\n' })
+  const laeufe: string[] = []
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    laeufe.push(a[0])
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (/devskim/i.test(a[0])) return { value: { ...done, stdout: '3|16|Important|DS148264|Do not use weak/non-cryptographic random number generators\r\n' } }
+    if (/gitleaks/i.test(a[0])) {
+      d[a[a.indexOf('--report-path') + 1]] = '[]'
+      return { value: done }
+    }
+    return { value: { ...done, exitCode: 1, stdout: "D:\\m\\Patch.cs(1,7): error CS0246: The type or namespace name 'HarmonyLib' could not be found\r\n" } }
+  })
+
+  const ran = await $.tool.call({ tool: 'Edit', file_path: 'D:\\m\\Patch.cs', old_string: 'a', new_string: 'b' })
+  const text = (ran.context ?? []).join('\n')
+
+  expect(text).toContain('✖ «Patch.cs»')
+  expect(text).toContain('UnpatchAll() ohne Kennung')
+  expect(laeufe.some(x => /devskim/i.test(x))).toBe(true)
+  expect(laeufe.some(x => /cppcheck/i.test(x))).toBe(false)
+  const bericht = d['C:\\Users\\probe\\Code-Waechter\\security-report.txt'] ?? ''
+  expect(bericht).toContain('D:\\m\\Patch.cs  (DevSkim, Gitleaks, Muster)')
+  expect(bericht).toContain('FEHLER  Zeile 3')
+  expect(bericht).toContain('HINWEIS Zeile 3:17  DevSkim DS148264') // DevSkim zählt Spalten ab 0, der Wächter ab 1
+})
+
+test('Sicherheits-Scanner: Python ohne Bandit bleibt ✔, nennt aber offen, was fehlt', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.exists', () => ({ value: true }))
+  const d = platte(on, { 'D:\\p\\a.py': 'x = 1\n' })
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (a.includes('bandit')) return { value: { ...done, exitCode: 1, stderr: 'C:\\Python\\python.exe: No module named bandit\r\n' } }
+    if (/gitleaks/i.test(a[0])) d[a[a.indexOf('--report-path') + 1]] = '[]'
+    return { value: done }
+  })
+
+  const ran = await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\a.py', content: 'x = 1\n' })
+  const text = (ran.context ?? []).join('\n')
+
+  expect(text).toContain('✔ «a.py»')
+  expect(text).toContain('Bandit fehlt (einmalig: py -m pip install bandit)')
+  expect(d['C:\\Users\\probe\\Code-Waechter\\security-report.txt']).toBe(undefined) // keine Funde, kein Eintrag
+})
+
+// Gegenprüfung 20.11.2026: Befunde zur Anbindung der Scanner
+test('Sicherheits-Scanner: Geheimnis in einer Datei, deren Grundprüfung nicht laufen kann, wird trotzdem rot - ohne die Zeile zu zeigen', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  const d = platte(on, { 'D:\\p\\skript.groovy': 'local token = "GEHEIMWERT-NICHT-ZEIGEN"\n' })
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (/gitleaks/i.test(a[0])) {
+      d[a[a.indexOf('--report-path') + 1]] = JSON.stringify([{ RuleID: 'github-pat', Description: 'GitHub Personal Access Token', StartLine: 1, StartColumn: 16, Secret: 'REDACTED' }])
+    }
+    return { value: done }
+  })
+
+  const ran = await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\skript.groovy', content: 'x' })
+  const text = (ran.context ?? []).join('\n')
+
+  expect(text).toContain('✖ «skript.groovy»')
+  expect(text).toContain('Grundprüfung nicht möglich')
+  expect(text).toContain('github-pat')
+  expect(text).not.toContain('GEHEIMWERT')
+})
+
+test('Sicherheits-Scanner: Einstellungsdateien (.env) laufen durch Gitleaks', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  const d = platte(on, { 'D:\\p\\.env': 'A=1\n' })
+  const laeufe: string[] = []
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    laeufe.push(a[0])
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (/gitleaks/i.test(a[0])) d[a[a.indexOf('--report-path') + 1]] = '[]'
+    return { value: done }
+  })
+
+  const ran = await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\.env', content: 'A=1\n' })
+  const text = (ran.context ?? []).join('\n')
+
+  expect(laeufe.some(x => /gitleaks/i.test(x))).toBe(true)
+  expect(text).toContain('✔ «.env»: Einstellungsdatei (Zugangsdaten) + Gitleaks')
+})
+
+test('Sicherheits-Scanner: ein roter Bandit-Fund bleibt rot, auch wenn Ruff dieselbe Regel als Vorschlag nennt', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.exists', () => ({ value: true })) // Ruff ist geladen
+  const d = platte(on, { 'D:\\p\\b.py': 'import subprocess\nsubprocess.call(x, shell=True)\n' })
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (/ruff/i.test(a[0])) return { value: { ...done, exitCode: 1, stdout: 'D:\\p\\b.py:2:1: S602 `subprocess` call with `shell=True` identified, security issue\n' } }
+    if (a.includes('bandit')) {
+      return { value: { ...done, exitCode: 1, stdout: JSON.stringify({ errors: [], metrics: { 'D:/p/b.py': { loc: 2 }, _totals: {} }, results: [{ issue_severity: 'HIGH', issue_confidence: 'HIGH', issue_text: 'subprocess call with shell=True identified, security issue.', line_number: 2, col_offset: 0, test_id: 'B602' }] }) } }
+    }
+    if (/gitleaks/i.test(a[0])) d[a[a.indexOf('--report-path') + 1]] = '[]'
+    return { value: done }
+  })
+
+  const ran = await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\b.py', content: 'x' })
+  const text = (ran.context ?? []).join('\n')
+
+  expect(text).toContain('✖ «b.py»')
+  expect(text).toContain('B602')
 })

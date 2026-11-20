@@ -9,6 +9,8 @@ import { gameChecks } from './spiele'
 import { windowsChecks } from './windows'
 import { HARD_CODE, hardeningChecks } from './haertung'
 import { clearExeCache, isAbsolute, resolveExe } from './prozess'
+import { berichtBlock, berichtNeu, scannen } from './sicherheit'
+import type { Ergebnis, Umgebung } from './sicherheit'
 
 // Code-Wächter: prüft jede Datei, die Claude mit Write oder Edit schreibt, gleich nach dem Schreiben.
 // Gefundene Fehler gehen als Hinweis an Claude (context des Werkzeugergebnisses), damit sie sofort behoben werden.
@@ -29,7 +31,8 @@ const runningAtom = atom({ plugin: 'code-waechter', key: 'running' } as const, [
 const frameAtom = atom({ plugin: 'code-waechter', key: 'frame' } as const, 0)
 
 // ====================================================================================== Ergebnisse
-type Finding = { file: string; line: number; col: number; code: string; text: string }
+// geheim: die Fundstelle enthält ein Geheimnis (z. B. Gitleaks) - ihre Quelltextzeile wird nie gezeigt.
+type Finding = { file: string; line: number; col: number; code: string; text: string; geheim?: boolean }
 type Outcome =
   // hints: Verbesserungsvorschläge (ungenutzte Variablen, Leistung, Sicherheit); nie ein Fehler, höchstens HINTS_SHOWN je Datei
   // limit: was bei diesem ✔ ausdrücklich nicht geprüft wurde (z. B. nur Syntax, weil kein Projekt oder Ordner nicht freigegeben)
@@ -48,6 +51,8 @@ type Kind =
   // Weitere Sprachen: Sprachpakete (tree-sitter, Sprache nach Endung in TS_LANGS), VB.NET und F# mit den Übersetzern des .NET-SDK,
   // Shader (HLSL mit dxc, GLSL mit glslang, Unity nur Aufbau), Zig, Luau, Sass, Bicep, Assembler (ml64), R, Vue
   | 'treesitter' | 'vbnet' | 'fsharp' | 'hlsl' | 'shaderlab' | 'glslstage' | 'zig' | 'luau' | 'sass' | 'bicep' | 'masm' | 'r' | 'vue' | 'matlab'
+  // Einstellungsdateien (.env, .ini, .cfg, .conf, .properties): keine Schreibweise, nur Zugangsdaten und Gitleaks
+  | 'einstellung'
   // Sprachen, für die es (noch) kein Prüfprogramm gibt: offen NICHT GEPRÜFT statt still nichts
   | 'nochecker'
 
@@ -174,6 +179,13 @@ const KINDS: Record<string, Kind[]> = {
   r: ['r'],
   vue: ['vue'],
   m: ['matlab'], // MATLAB; Objective-C (gleiche Endung) erkennt checkMatlab am Inhalt
+  pyw: ['python'], // Python ohne Konsolenfenster
+  // Einstellungsdateien, in denen oft Zugangsdaten stehen
+  env: ['einstellung'],
+  ini: ['einstellung'],
+  cfg: ['einstellung'],
+  conf: ['einstellung'],
+  properties: ['einstellung'],
 }
 
 // Sprachpakete (tree-sitter) je Endung. sicher: an echtem Code großer öffentlicher Projekte gemessen (27.10.2026, je Sprache 16 bis
@@ -3730,6 +3742,8 @@ async function runKind($: any, kind: Kind, file: string): Promise<Outcome> {
       return checkVue($, file)
     case 'matlab':
       return checkMatlab($, file)
+    case 'einstellung':
+      return { status: 'ok', what: t('Einstellungsdatei (Zugangsdaten)', 'settings file (secrets)'), others: [] }
     case 'nochecker':
       return noChecker(NO_CHECKER[/\.([^.\\]+)$/.exec(file)?.[1].toLowerCase() ?? ''] ?? baseName(file))
   }
@@ -3805,6 +3819,7 @@ const where = (f: Finding): string =>
 const OWN_CODES = new Set([
   'SEC-BEFEHL', 'SEC-EVAL', 'SEC-EXTRACT', 'SEC-GEHEIMNIS', 'SEC-INCLUDE', 'SEC-PFAD', 'SEC-PREGE', 'SEC-SQL', 'SEC-TLS',
   'SEC-UNSERIALIZE', 'SEC-WEITERLEITUNG', 'SEC-XSS', 'UNITY', 'UNREAL', 'UHT', 'GIT', HARD_CODE,
+  'HARMONY-UNPATCH', 'HARMONY-ID', 'HARMONY-STATISCH', 'PROCESS-START',
 ])
 const isOwn = (code: string): boolean => OWN_CODES.has(code)
 // Die Codes der Sicherheitsmuster auf Englisch, wenn die Meldungen englisch sind (intern bleiben die deutschen Namen).
@@ -3855,7 +3870,7 @@ async function note($: any, file: string, o: Outcome): Promise<string> {
   const shown = o.mine.slice(0, 8)
   // Quelltextzeilen sind Daten aus der Datei: bereinigt, Schlüssel unkenntlich, bei gefundenen Zugangsdaten gar nicht gezeigt.
   const body = shown.flatMap(f => {
-    const src = f.code === 'SEC-GEHEIMNIS' ? undefined : lines[f.line - 1]
+    const src = f.code === 'SEC-GEHEIMNIS' || f.geheim === true ? undefined : lines[f.line - 1]
     return [`  ${where(f)}: ${what(f)}`, ...(src !== undefined ? [`      > ${daten(maskSecrets(src), 160)}`] : [])]
   })
   const more = o.mine.length > shown.length ? [t(`  … und ${o.mine.length - shown.length} weitere Fehler in dieser Datei.`, `  … and ${o.mine.length - shown.length} more errors in this file.`)] : []
@@ -4104,6 +4119,87 @@ async function autoReport($: any, e: any, next: any): Promise<any> {
   return ran
 }
 
+// ---- Sicherheits-Scanner nach dem Schreiben (sicherheit.ts): DevSkim, Cppcheck, Bandit, Gitleaks und eigene Muster, je nach
+// Dateiart. Nur nach dem Schreiben (runCheck), nicht im /scan: ein Scan über ein ganzes Projekt würde sonst vier Programme je Datei
+// starten. Funde gehen gebündelt in <Ablage>\security-report.txt.
+async function scannerOrt($: any, name: 'devskim' | 'cppcheck' | 'gitleaks'): Promise<string | undefined> {
+  const imPfad = await resolveExe($, name)
+  if (imPfad) return imPfad
+  const orte: Record<typeof name, string[]> = {
+    devskim: [`${String((await $.env.get('USERPROFILE')) ?? '')}\\.dotnet\\tools\\devskim.exe`],
+    cppcheck: [`${String((await $.env.get('ProgramFiles')) ?? '') || 'C:\\Program Files'}\\Cppcheck\\cppcheck.exe`],
+    // winget legt Gitleaks in seinen Paketordner und trägt diesen in den Suchpfad ein (gemessen 20.11.2026, 8.30.1: Links blieb leer);
+    // der Suchpfad der App gilt erst nach ihrem Neustart, darum beide Orte direkt.
+    gitleaks: [
+      `${String((await $.env.get('LOCALAPPDATA')) ?? '')}\\Microsoft\\WinGet\\Packages\\Gitleaks.Gitleaks_Microsoft.Winget.Source_8wekyb3d8bbwe\\gitleaks.exe`,
+      `${String((await $.env.get('LOCALAPPDATA')) ?? '')}\\Microsoft\\WinGet\\Links\\gitleaks.exe`,
+    ],
+  }
+  for (const o of orte[name]) {
+    if (!isAbsolute(o)) continue
+    try {
+      if (await $.fs.exists(o)) return o
+    } catch {
+      // nicht lesbar: nächster Ort
+    }
+  }
+  return undefined
+}
+
+const scannerUmgebung = ($: any, kennung: string): Umgebung => ({
+  kennung,
+  run: (argv, opts) => sh($, argv, opts),
+  python: PYTHON,
+  exe: name => scannerOrt($, name),
+  workDir: () => workDir($),
+  read: p => readText($, p),
+  write: async (p, text) => {
+    await $.fs.write(p, text)
+  },
+})
+
+async function berichtSchreiben($: any, file: string, e: Ergebnis): Promise<void> {
+  if (e.funde.length === 0) return
+  const pfad = `${await ablage($)}\\security-report.txt`
+  const d = new Date(await $.clock.now())
+  const zwei = (n: number) => String(n).padStart(2, '0')
+  const zeit = `${zwei(d.getDate())}.${zwei(d.getMonth() + 1)}.${d.getFullYear()} ${zwei(d.getHours())}:${zwei(d.getMinutes())}:${zwei(d.getSeconds())}`
+  await $.fs.write(pfad, berichtNeu(await readText($, pfad), berichtBlock(zeit, norm(file), e)))
+}
+
+async function withScanners($: any, file: string, out: Outcome): Promise<Outcome> {
+  let e: Ergebnis
+  try {
+    e = await scannen(scannerUmgebung($, await sidOf($)), norm(file), await readText($, file))
+  } catch (err) {
+    const gap = t('Sicherheits-Scanner (interner Fehler: ', 'security scanners (internal error: ') + clip(String((err as { message?: string })?.message ?? err), 120) + ')'
+    return out.status === 'ok' ? { ...out, limit: out.limit ? `${out.limit}; ${gap}` : gap } : out
+  }
+  // Der Bericht ist Zugabe: lässt er sich nicht schreiben, bleibt das Prüfergebnis gleich.
+  await safe(berichtSchreiben($, file, e))
+  const ruff = new Set((out.status === 'ok' ? (out.hints ?? []) : []).map(h => `${h.line}|${h.code}`))
+  const geheim = new Set((out.status === 'fehler' ? out.mine : []).filter(f => f.code === 'SEC-GEHEIMNIS').map(f => f.line))
+  const funde = e.funde.filter(f =>
+    // Doppelte weglassen: ein Bandit-HINWEIS, den Ruff auf derselben Zeile schon nennt (B602 = S602) - ein roter Bandit-Fund bleibt,
+    // Ruff kennt nur Hinweise; Gitleaks auf einer Zeile, die schon als Zugangsdaten rot ist.
+    !(f.scanner === 'Bandit' && !f.schwer && ruff.has(`${f.line}|S${f.code.replace(/^B/, '')}`)) && !(f.scanner === 'Gitleaks' && geheim.has(f.line)))
+  const als = (f: (typeof funde)[number]): Finding => ({ file, line: f.line, col: f.col, code: f.code, text: `${f.scanner}: ${f.text}`, ...(f.geheim ? { geheim: true } : {}) })
+  const schwer = funde.filter(f => f.schwer).map(als)
+  const leicht = funde.filter(f => !f.schwer).map(als)
+  const namen = e.liefen.length > 0 ? ` + ${e.liefen.join(', ')}` : ''
+  if (out.status === 'fehler') return schwer.length > 0 ? { ...out, mine: [...out.mine, ...schwer] } : out
+  // Konnte die Grundprüfung nicht laufen, gehen rote Scanner-Funde (z. B. ein Geheimnis) trotzdem nie verloren.
+  if (out.status === 'ungeprueft') {
+    return schwer.length > 0
+      ? { status: 'fehler', what: `${out.what}${namen} (${t('Grundprüfung nicht möglich', 'base check not possible')}: ${clip(out.reason, 160)})`, mine: schwer, others: [] }
+      : out
+  }
+  if (schwer.length > 0) return { status: 'fehler', what: `${out.what}${namen}`, mine: schwer, others: out.others }
+  const gap = e.luecken.join('; ')
+  const mitLuecke: Outcome = gap === '' ? { ...out, what: `${out.what}${namen}` } : { ...out, what: `${out.what}${namen}`, limit: out.limit ? `${out.limit}; ${gap}` : gap }
+  return withHints(mitLuecke, leicht, file)
+}
+
 // Eine Prüfung samt Anzeige. Die Anzeige wird auch bei einem Fehler unterwegs zurückgesetzt.
 async function runCheck($: any, file: string, kinds: Kind[]): Promise<string> {
   const id = `p${++counter}`
@@ -4114,7 +4210,7 @@ async function runCheck($: any, file: string, kinds: Kind[]): Promise<string> {
     const t0 = await $.clock.now()
     await safe(update($, runningAtom, l => [...l, { id, file: baseName(file), kind: kinds[kinds.length - 1] }]))
     try {
-      outcome = await checkFile($, file, kinds)
+      outcome = await withScanners($, file, await checkFile($, file, kinds))
     } catch (err) {
       outcome = unchecked(t('Prüfung', 'check'), t('interner Fehler: ', 'internal error: ') + String((err as { message?: string })?.message ?? err).slice(0, 140))
     }
