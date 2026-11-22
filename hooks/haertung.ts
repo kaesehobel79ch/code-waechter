@@ -179,7 +179,331 @@ function unboundedLoops(text: string, code: string, file: string): HardFinding[]
 
 export function csHardeningHints(text: string, file: string): HardFinding[] {
   const code = blankCode(text)
-  return [...catchAllAsEmpty(text, code, file), ...unboundedLoops(text, code, file)].sort((a, b) => a.line - b.line)
+  return [...catchAllAsEmpty(text, code, file), ...unboundedLoops(text, code, file), ...csThreats(text, code, file).filter(f => !f.schwer)].sort((a, b) => a.line - b.line)
+}
+
+// ---- Bedrohungen, die beim Schreiben erkennbar sind (21.11.2026, aus den 54 Funden eines Härtetests: 12 davon folgen
+// einem Muster, das in jedem C#-Projekt gefährlich ist). Schwere Fälle (schwer) sind
+// Fehler, die übrigen Hinweise. Gesucht wird je Methode (vom Kopf eines Mitglieds bis zum nächsten). Bewusste Stellen: wie oben
+// "code-waechter:ok HAERTUNG" in der Zeile.
+export type ThreatFinding = HardFinding & { regel: string; schwer: boolean }
+
+// Kopf eines Typs oder Namensraums vor einer "{" (class Name, record Name(...), namespace A.B); "where T : class" ist keiner.
+const TYPE_HEAD = /\b(?:class|struct|interface|enum|record|namespace)\s+@?[A-Za-z_][\w.]*[^;{}]*$/
+
+// Die Mitglieder der Datei als Abschnitte [von, bis) im bereinigten Text, nach Klammertiefe: ein Abschnitt endet, wo ein
+// Mitglied im Rumpf eines Typs mit "}" oder ";" endet. Am 21.11.2026 gemessen: die Erkennung über Zugriffswörter am Zeilenanfang
+// trennte Methoden an "new X(" und "async (" und legte Methoden ohne Zugriffswort mit der vorigen zusammen.
+function memberSegments(code: string): [number, number][] {
+  const cuts = [0]
+  const typ: boolean[] = [] // je offene "{": Rumpf eines Typs oder Namensraums?
+  let last = 0
+  for (let i = 0; i < code.length; i++) {
+    const c = code[i]
+    if (c === '{') {
+      const isType = (typ.length === 0 || typ[typ.length - 1]) && TYPE_HEAD.test(code.slice(last, i))
+      typ.push(isType)
+      if (isType) cuts.push((last = i + 1))
+    } else if (c === '}') {
+      const war = typ.pop()
+      if (war || typ[typ.length - 1]) cuts.push((last = i + 1))
+    } else if (c === ';' && typ[typ.length - 1]) cuts.push((last = i + 1))
+  }
+  cuts.push(code.length)
+  const out: [number, number][] = []
+  for (let k = 0; k + 1 < cuts.length; k++) if (/\S/.test(code.slice(cuts[k], cuts[k + 1]))) out.push([cuts[k], cuts[k + 1]])
+  return out
+}
+
+// Eine Bedrohung melden: Zeile im Originaltext; bewusst markierte Zeilen fallen weg.
+function threat(text: string, file: string, at: number, regel: string, schwer: boolean, de: string, en: string): ThreatFinding | undefined {
+  if (marked(text, at, at)) return undefined
+  return { file, line: lineAt(text, at), col: 0, code: HARD_CODE, regel, schwer, text: t(`${schwer ? 'Sicherheit' : 'Härtung'} (${regel}): ${de}`, `${schwer ? 'security' : 'hardening'} (${regel}): ${en}`) }
+}
+
+// Die Argumente eines Aufrufs (bereinigter Text) ab der öffnenden Klammer.
+function argsAt(code: string, open: number): string {
+  const close = closing(code, open)
+  return close === -1 ? code.slice(open + 1, open + 400) : code.slice(open + 1, close)
+}
+
+const SECRET_NAME = /\b\w*(?:token|passwor[dt]|kennwort|secret|codewort|api_?key)\w*\b/gi
+const SECRET_HARMLESS = /(?:count|length|anzahl|gueltig|valid|expired|abgelaufen|ablauf|expiry|expires|hash|name|feld|field|art|kind|type|typ|source)$/i
+const FRAMEWORK_CHECK = /\b(?:Uri|char|Char|string|String|Regex|Path|File|Directory|Enum|Type|Guid|DateTime|Math|IPAddress|Encoding|int|long|double|decimal|Int32|Int64|Double|Nullable|Environment|Debugger|object|Object)\s*\.\s*$/
+const CHECK_CALL = /\b((?:Ist|Is|Enthaelt|Pruef|Check|Validate)\w*)\s*\(\s*([A-Za-z_]\w*)\s*[,)]/g
+
+// Fest eingebaute Bytes: Literal-Bytes, "..."u8, Encoding.X.GetBytes("Literal"), stackalloc mit Werten, { 1, 2 } und [0x4B, ...].
+// Eine Zeichenkette mit Einsetzungen ($"{benutzer}:{kennwort}") ist nicht fest.
+const FIXED_BYTES = /GetBytes\s*\(\s*(?:@?"|\$@?"[^"{]*")|new\s+byte\s*\[\s*\d*\s*\]\s*\{|"[^"]*"u8|\bstackalloc\s+byte\s*\[\s*\d*\s*\]\s*\{|^\s*(?:new\s*\[\s*\]\s*)?[{[]\s*(?:0x[\da-f]|\d)/i
+
+// Prüfdateien und Prüfprojekte (Tests, X.Tests, UnitTests, X.Probe): dort sind feste Werte gewollt
+// (21.11.2026: ein Probe-Projekt prüft PBKDF2 mit einem festen Probe-Salz gegen .NET).
+const TEST_PATH = /\.test\.|[\\/](?:[^\\/]*[._-])?(?:(?:Unit|Integration)?Tests?|Probe)[\\/]/i
+
+// Ein Zufallsname in derselben Anweisung macht einen Temp-Pfad unvorhersagbar.
+const RANDOM_NAME = /\bCreateTempSubdirectory\b|\bGetRandomFileName\b|\bGetTempFileName\b|\bGuid\s*\.\s*NewGuid\b/
+
+// Startet der Abschnitt nur das eigene Programm, einen festen Programmnamen oder eine Adresse (Neustart als Admin, Link öffnen)?
+// Dann kommt nichts aus Temp. Geprüft werden das erste Argument von Process.Start/ProcessStartInfo und FileName = ....
+function ownStartOnly(text: string, code: string, from: number, seg: string): boolean {
+  const ziele: string[] = []
+  for (const m of seg.matchAll(/\b(?:Process\s*\.\s*Start|new\s+ProcessStartInfo)\s*\(/g)) {
+    const open = from + (m.index ?? 0) + m[0].length - 1
+    const a = splitArgs(text.slice(open + 1, open + 1 + argsAt(code, open).length))[0]?.trim() ?? ''
+    // Process.Start(new ProcessStartInfo(...)) und Process.Start(psi): das Ziel steht im ProcessStartInfo bzw. bei FileName.
+    if (a !== '' && !/^new\b/.test(a) && !/^@?[A-Za-z_]\w*$/.test(a)) ziele.push(a)
+  }
+  for (const m of seg.matchAll(/\bFileName\s*=\s*/g)) {
+    const at = from + (m.index ?? 0) + m[0].length
+    const end = code.slice(at).search(/[,;}\n]/)
+    ziele.push(text.slice(at, end === -1 ? at + 200 : at + end).trim())
+  }
+  const eigen = (z: string): boolean =>
+    /\b(?:Environment\s*\.\s*ProcessPath|Application\s*\.\s*ExecutablePath|GetCurrentProcess\s*\(\s*\)\s*\.\s*MainModule|AppContext\s*\.\s*BaseDirectory)\b/.test(z) ||
+    /^@?"[^"{]*"$/.test(z)
+  return ziele.length > 0 && ziele.every(eigen)
+}
+
+const DELETES = /\bFile\s*\.\s*Delete\s*\(|\bDirectory\s*\.\s*Delete\s*\(|\bDeleteSubKey(?:Tree)?\s*\(|\w*Loeschen\s*\(|\bDelete(?:\w*[A-Z]\w*)?\s*\(/
+
+// Steht ein Löschen im Zweig eines Startschalters "--x"? Der Schalter muss im Code stehen (nicht im Kommentar).
+function switchDeletes(code: string, from: number, raw: string): boolean {
+  for (const m of raw.matchAll(/"--?[A-Za-z][\w-]*"/g)) {
+    const at = from + (m.index ?? 0)
+    if (code[at] !== '"') continue
+    // case "--x": bis zum nächsten break/return
+    const vor = code.slice(Math.max(0, at - 40), at)
+    if (/\bcase\s*$/.test(vor)) {
+      const ende = code.slice(at).search(/\bbreak\s*;|\breturn\b|\bcase\b|\bdefault\s*:/)
+      if (DELETES.test(code.slice(at, ende === -1 ? at + 2000 : at + ende))) return true
+      continue
+    }
+    // if (... "--x" ...): die Klammer der Bedingung, dann ein Block oder eine Anweisung
+    const ifAt = code.slice(Math.max(0, at - 400), at).search(/\bif\s*\([^;{}]*$/)
+    if (ifAt === -1) continue
+    const open = code.indexOf('(', Math.max(0, at - 400) + ifAt)
+    const close = closing(code, open)
+    if (close === -1 || close < at) continue
+    let k = close + 1
+    while (k < code.length && /\s/.test(code[k])) k++
+    const bodyEnd = code[k] === '{' ? closing(code, k) : code.indexOf(';', k)
+    if (bodyEnd !== -1 && DELETES.test(code.slice(k, bodyEnd + 1))) return true
+  }
+  return false
+}
+
+// Der Wert eines Namens beim Aufruf: die letzte Zuweisung davor im Abschnitt (byte[] salt = ...), sonst ein Feld der Datei.
+function valueAt(text: string, code: string, name: string, segFrom: number, before: number): string | undefined {
+  const n = name.replace(/\s*\.\s*(?:ToArray|AsSpan|Span)\s*\(\s*\)\s*$/, '').trim()
+  if (!/^@?[A-Za-z_]\w*$/.test(n)) return undefined
+  const re = new RegExp(`(?<![\\w.])${n.replace('@', '')}\\s*=(?![=>])\\s*`, 'g')
+  let last = -1
+  for (const m of code.slice(segFrom, before).matchAll(re)) last = segFrom + (m.index ?? 0) + m[0].length
+  if (last !== -1) {
+    const end = code.indexOf(';', last)
+    return text.slice(last, end === -1 ? last + 300 : end)
+  }
+  return fieldValue(text, code, n.replace('@', ''))
+}
+
+// Die Argumente eines Aufrufs an den Kommas der obersten Ebene.
+function splitArgs(a: string): string[] {
+  const out: string[] = []
+  let tiefe = 0
+  let start = 0
+  for (let i = 0; i < a.length; i++) {
+    const c = a[i]
+    if (c === '(' || c === '[' || c === '{' || c === '<') tiefe++
+    else if (c === ')' || c === ']' || c === '}' || c === '>') tiefe--
+    else if (c === ',' && tiefe === 0) {
+      out.push(a.slice(start, i))
+      start = i + 1
+    }
+  }
+  out.push(a.slice(start))
+  return out
+}
+
+// Der Wert eines Felds oder einer Konstanten der Datei (const/readonly NAME = Wert;), sonst undefined. Nur einfache Namen.
+function fieldValue(text: string, code: string, name: string): string | undefined {
+  if (!/^[A-Za-z_]\w*$/.test(name)) return undefined
+  const m = new RegExp(`\\b(?:const|readonly|static)\\b[^;={}()]*\\b${name}\\s*=\\s*`).exec(code)
+  if (!m) return undefined
+  const start = m.index + m[0].length
+  const end = code.indexOf(';', start)
+  return text.slice(start, end === -1 ? start + 300 : end)
+}
+
+function csThreats(text: string, code: string, file: string): ThreatFinding[] {
+  if (TEST_PATH.test(file)) return []
+  const out: (ThreatFinding | undefined)[] = []
+  // Ein fester Ordner unter Temp in der Datei (Path.Combine(Path.GetTempPath(), "Name") oder %TEMP%): eine Anweisung im Code
+  // (nicht im Kommentar), in der kein Zufallsname mitgebaut wird (Guid, GetRandomFileName ... in derselben Anweisung).
+  const fixedTemp = [...code.matchAll(/\bPath\s*\.\s*Combine\s*\(\s*Path\s*\.\s*GetTempPath\s*\(\s*\)\s*,\s*\$?@?"|\bGetEnvironmentVariable\s*\(\s*"/g)].some(m => {
+    const at = m.index ?? 0
+    if (/GetEnvironmentVariable/.test(m[0]) && !/^GetEnvironmentVariable\s*\(\s*"(?:TEMP|TMP)"/.test(text.slice(at, at + 40))) return false
+    const start = Math.max(code.lastIndexOf(';', at), code.lastIndexOf('{', at), code.lastIndexOf('}', at)) + 1
+    const end = code.indexOf(';', at)
+    return !RANDOM_NAME.test(code.slice(start, end === -1 ? code.length : end))
+  })
+  for (const [from, to] of memberSegments(code)) {
+    const seg = code.slice(from, to)
+    const raw = text.slice(from, to)
+    const at = (re: RegExp): number => {
+      const m = re.exec(seg)
+      return m ? from + m.index : from
+    }
+
+    // R1: Programm aus einem festen Ordner unter Temp starten (dort kann ein anderes Programm eine DLL unterschieben; mit
+    // Adminrechten läuft sie dann mit). Herunterladen und Starten liegen oft in verschiedenen Methoden (Update-Dienst),
+    // darum gilt der Ordner für die ganze Datei; gemeldet wird der Start mit der Shell (UseShellExecute oder runas).
+    if (fixedTemp && /\bProcess\s*\.\s*Start\b|\bProcessStartInfo\b/.test(seg) && /\bUseShellExecute\s*=\s*true\b|\bVerb\s*=\s*"runas"/i.test(raw) && !ownStartOnly(text, code, from, seg)) {
+      const admin = /\bVerb\s*=\s*"runas"/i.test(raw)
+      out.push(threat(text, file, at(/\bProcess\s*\.\s*Start\b|\bProcessStartInfo\b/), 'R1', admin,
+        `ein Programm wird aus einem festen Ordner unter Temp gestartet${admin ? ' (mit Adminrechten)' : ''} – dort kann ein anderes Programm eine DLL unterschieben, die beim Start mitläuft. In einen frisch angelegten, zufällig benannten Ordner laden (Directory.CreateTempSubdirectory) und direkt vor dem Start prüfen, dass nur die eigene Datei darin liegt.`,
+        `a program is started from a fixed folder under Temp${admin ? ' (with admin rights)' : ''} – another program can plant a DLL there that runs along. Download into a freshly created, randomly named folder (Directory.CreateTempSubdirectory) and check right before the start that only your own file is in it.`))
+    }
+
+    // R2: Schlüssel aus einem Kennwort mit festem Salz (Fehler) oder zu wenigen Runden (Hinweis). Salz und Runden stehen oft in
+    // einem Feld oder einer Konstanten der Klasse; deren Wert wird nachgeschlagen.
+    for (const m of seg.matchAll(/\bRfc2898DeriveBytes\s*(?:\.\s*Pbkdf2\s*)?\(/g)) {
+      const open = from + (m.index ?? 0) + m[0].length - 1
+      const argText = text.slice(open + 1, open + 1 + argsAt(code, open).length)
+      const teile = splitArgs(argText)
+      const werte = teile.map(x => fieldValue(text, code, x.trim()) ?? x)
+      // Das Salz: das zweite Argument oder "salt:" (nicht das Kennwort davor).
+      const salzArg = teile.find(x => /^\s*salt\s*:/.test(x))?.replace(/^\s*salt\s*:/, '') ?? teile[1] ?? ''
+      const salz = valueAt(text, code, salzArg.trim(), from, open) ?? salzArg
+      if (FIXED_BYTES.test(salz.trim())) {
+        out.push(threat(text, file, open, 'R2', true,
+          'Schlüssel wird mit einem festen Salz abgeleitet – gleiches Kennwort gibt überall denselben Schlüssel (vorberechenbar). Salz mit RandomNumberGenerator.GetBytes(16) erzeugen und mit dem Ergebnis speichern.',
+          'key is derived with a fixed salt – the same password gives the same key everywhere (precomputable). Create the salt with RandomNumberGenerator.GetBytes(16) and store it with the result.'))
+      }
+      const runden = werte.map(w => /^\s*(\d[\d_']*)\s*$/.exec(w)?.[1]).filter((x): x is string => x !== undefined).map(x => Number(x.replace(/[_']/g, ''))).find(n => n >= 1000)
+      if (runden !== undefined && runden < 600000) {
+        out.push(threat(text, file, open, 'R2', false,
+          `Schlüsselableitung mit nur ${runden} Runden – mindestens 600000 (PBKDF2 mit SHA-256), sonst lässt sich ein Kennwort schnell durchprobieren.`,
+          `key derivation with only ${runden} iterations – use at least 600000 (PBKDF2 with SHA-256), otherwise a password can be brute-forced quickly.`))
+      }
+    }
+
+    // R3: Bild aus dem Netz ohne Grössengrenze entpacken.
+    if (/\b(?:BitmapImage|BitmapDecoder|BitmapFrame)\b/.test(seg) && /\b(?:GetByteArrayAsync|GetStreamAsync|ReadAsByteArrayAsync|ReadAsStreamAsync)\b/.test(seg) &&
+      !/\bDecodePixel(?:Width|Height)\b|\bPixel(?:Width|Height)\b/.test(seg)) {
+      out.push(threat(text, file, at(/\b(?:BitmapImage|BitmapDecoder|BitmapFrame)\b/), 'R3', false,
+        'Bild aus dem Netz wird ohne Grössengrenze entpackt – ein kleines Bild kann riesig entpacken (Speicher voll). Bytes begrenzen und DecodePixelWidth/-Height setzen oder PixelWidth/-Height prüfen.',
+        'image from the network is decoded without a size limit – a small file can decode huge (memory full). Limit the bytes and set DecodePixelWidth/-Height or check PixelWidth/-Height.'))
+    }
+
+    // R4: Entschlüsselung gibt bei fehlender Kennung den Eingabetext unverändert zurück (Fälschung als Klartext möglich).
+    if (/\bAesGcm\b|\.\s*Decrypt\s*\(|\bUnprotect\s*\(|\bCreateDecryptor\s*\(/.test(seg)) {
+      const m = /\bif\s*\(\s*!\s*(?:\(\s*)?([A-Za-z_]\w*)\s*(?:\?\s*)?\.\s*StartsWith\s*\([^)]*\)\s*\)*\s*\)\s*\{?\s*return\s+\1\s*;/.exec(seg)
+      if (m) {
+        out.push(threat(text, file, from + m.index, 'R4', false,
+          'Entschlüsselung gibt Text ohne Kennung unverändert zurück – wer den Speicher beschreiben kann, legt so beliebigen Inhalt als "echt" ab. Nach der Umstellung Text ohne Kennung als unlesbar behandeln.',
+          'decryption returns text without the marker unchanged – whoever can write the storage can plant any content as "genuine". After the migration treat unmarked text as unreadable.'))
+      }
+    }
+
+    // R5: Ein Startargument löst eine zerstörende Aktion aus (ohne Rückfrage kann jedes andere Programm sie auslösen).
+    // Gemeldet wird nur, wenn das Löschen im Zweig des Schalters steht (if (... "--x" ...) { ... } oder case "--x": ...).
+    if (/\bGetCommandLineArgs\b|\b(?:e\s*\.\s*)?Args\b|\bargs\b/.test(seg) && switchDeletes(code, from, raw)) {
+      out.push(threat(text, file, at(/\bGetCommandLineArgs\b|\b(?:e\s*\.\s*)?Args\b|\bargs\b/), 'R5', false,
+        'ein Startargument löscht oder überschreibt etwas – jedes andere Programm kann es so auslösen. Nur mit einer Bestätigung oder einem Wert, den nur der Deinstallierer kennt; nie, wenn das Programm schon läuft.',
+        'a start argument deletes or overwrites something – any other program can trigger it. Only with a confirmation or a value only the uninstaller knows; never while the program is already running.'))
+    }
+
+    // R6: Alle Eigenschaften per Reflection von einem anderen Objekt übernehmen (eine eingelesene Datei setzt so jede Einstellung,
+    // auch Adressen und Schalter). Muster: Schleife über GetProperties mit SetValue(ziel, eigenschaft.GetValue(quelle)).
+    if (/\.\s*GetProperties\s*\(/.test(seg) && /\.\s*SetValue\s*\(\s*[\w.]+\s*,\s*\w+\s*\.\s*GetValue\s*\(\s*[\w.]+\s*\)/.test(seg)) {
+      out.push(threat(text, file, at(/\.\s*GetProperties\s*\(/), 'R6', false,
+        'alle Eigenschaften werden per Reflection von einem anderen Objekt übernommen – kommt es aus einer Datei, setzt sie so auch Server-Adressen, Schlüssel und Sicherheitsschalter. Nur eine feste Liste erlaubter Eigenschaften übernehmen, wichtige erst nach Rückfrage.',
+        'all properties are copied by reflection from another object – if it comes from a file, it sets server addresses, keys and security switches too. Copy only a fixed list of allowed properties, important ones only after confirmation.'))
+    }
+
+    // R7: Erst prüfen, dann kürzen (das Kürzen kann aus einem harmlosen Wort ein gesperrtes machen oder einen Link bilden). Gekürzt
+    // wird oft eine abgeleitete Variable (geprüft wird text, gekürzt sauber = f(text)).
+    for (const m of seg.matchAll(CHECK_CALL)) {
+      const name = m[2] ?? ''
+      if (/^(?:IsNullOrEmpty|IsNullOrWhiteSpace|IsDigit|IsLetter|IsWhiteSpace|IsLetterOrDigit|IsUpper|IsLower|IsHighSurrogate|IsLowSurrogate|IsSurrogate|IsControl)$/.test(m[1] ?? '')) continue
+      // Prüfungen des Frameworks (Uri.IsWellFormedUriString, Path.IsPathRooted, Regex.IsMatch ...) sind kein eigener Filter.
+      if (FRAMEWORK_CHECK.test(seg.slice(Math.max(0, (m.index ?? 0) - 40), m.index ?? 0))) continue
+      const later = seg.slice((m.index ?? 0) + m[0].length)
+      const namen = [name, ...[...later.matchAll(new RegExp(`\\b([A-Za-z_]\\w*)\\s*=\\s*[^;=]*(?<![\\w.])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'))].map(x => x[1] ?? '')]
+      const cut = namen
+        .map(n => new RegExp(`(?<![\\w.])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?:\\.\\s*(?:Substring\\s*\\(\\s*0\\s*,|Remove\\s*\\()|\\[\\s*\\.\\.)`).exec(later))
+        .find((x): x is RegExpExecArray => x !== null)
+      // Nur ein Kürzen für die Anzeige (mit … oder ...): am 21.11.2026 waren die zwei Treffer ohne Auslassungszeichen in einem
+      // anderen Programm (Fingerabdruck, Pfadteile) keine Lücken.
+      // Satzende im bereinigten Text: ein ';' in einer Zeichenkette oder einem Zeichen (TrimEnd(';')) ist keins.
+      const cutAt = from + (m.index ?? 0) + m[0].length + (cut?.index ?? 0)
+      const satzEnde = code.indexOf(';', cutAt)
+      const satz = cut ? text.slice(cutAt, satzEnde === -1 ? cutAt + 400 : satzEnde) : ''
+      if (cut && /…|\.\.\."|"\.\.\./.test(satz)) {
+        out.push(threat(text, file, from + (m.index ?? 0) + m[0].length + cut.index, 'R7', false,
+          `«${name}» wird erst geprüft (${m[1]}) und danach gekürzt – das Kürzen kann aus einem harmlosen Wort ein gesperrtes machen oder einen Link bilden. Erst kürzen, dann den fertigen Text prüfen.`,
+          `«${name}» is checked first (${m[1]}) and cut afterwards – cutting can turn a harmless word into a blocked one or form a link. Cut first, then check the final text.`))
+        break
+      }
+    }
+
+    // R8: Liste aus einer Datei ohne Obergrenze übernehmen.
+    // Gesucht wird der Aufruf und davor in derselben Anweisung der Name (var ids = ...). Am 21.11.2026 gemessen: ein Muster
+    // "Typ Name = [^;]* Deserialize" brauchte für eine Datei mit 40000 Zeilen 4 Minuten.
+    for (const m of seg.matchAll(/\b(?:JsonSerializer\s*\.\s*Deserialize|JsonConvert\s*\.\s*DeserializeObject)\s*<\s*(?:List|IList|IEnumerable|HashSet|Dictionary|[\w.]+\s*\[\s*\])/g)) {
+      const at = m.index ?? 0
+      const vor = seg.slice(Math.max(seg.lastIndexOf(';', at), seg.lastIndexOf('{', at), seg.lastIndexOf('}', at)) + 1, at)
+      const name = /([A-Za-z_]\w*)\s*(?:\?\?)?=(?![=>])/.exec(vor)?.[1] ?? ''
+      if (name === '') continue
+      const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const used = new RegExp(`(?:AddRange|UnionWith)\\s*\\(\\s*${esc}\\b|foreach\\s*\\([^)]*\\bin\\s+${esc}\\b`).test(seg)
+      const bounded = new RegExp(`\\b${esc}\\s*(?:\\?\\s*)?\\.\\s*(?:Count|Length|Take)\\b`).test(seg)
+      if (used && !bounded) {
+        out.push(threat(text, file, from + at - vor.length, 'R8', false,
+          `«${name}» kommt aus einer Datei und wird ohne Obergrenze übernommen – eine aufgeblähte Datei füllt Speicher und Sicherungen. Anzahl begrenzen (Take oder Prüfung von Count) und jeden Eintrag wie eine Eingabe prüfen.`,
+          `«${name}» comes from a file and is taken over without a limit – a bloated file fills memory and backups. Limit the count (Take or a Count check) and check every entry like input.`))
+        break
+      }
+    }
+
+    // R9: Ein Befehl aus dem Chat wird nur am normalen Leerzeichen getrennt (geschütztes Leerzeichen oder Tab umgehen so z. B.
+    // "!stopp"). Nur wo die Methode einen Befehl mit "!" auswertet: am 21.11.2026 meldete die Regel ohne diese Grenze 42 Stellen
+    // in einem Chat-Programm, fast alle eigene, feste Texte.
+    {
+      const m = /\.\s*(?:Split|IndexOf|LastIndexOf)\s*\(\s*(?:' '|" ")\s*[,)]/.exec(raw)
+      if (m && code.slice(from + m.index, from + m.index + 2).trim() !== '' && /"!|'!'|StartsWith\s*\(\s*'!'/.test(raw)) {
+        out.push(threat(text, file, from + m.index, 'R9', false,
+          'ein Befehl wird nur am normalen Leerzeichen getrennt – ein geschütztes Leerzeichen oder ein Tab umgeht so den Befehl. char.IsWhiteSpace verwenden oder Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).',
+          'a command is split only at the normal space – a no-break space or a tab bypasses the command. Use char.IsWhiteSpace or Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).'))
+      }
+    }
+
+    // R10: Name eines Geheimnisses in einem Protokoll oder einer Meldung.
+    for (const m of seg.matchAll(/\b(?:Log(?!in|on|out|ged)\w*|(?:[Ll]og|_?[Ll]ogger|_log)\s*\.\s*(?:Information|Info|Debug|Warn\w*|Error|Fatal|Trace|Verbose|Critical|Log\w*|Write\w*)|Protokoll\w*|Console\s*\.\s*Write\w*|Debug\s*\.\s*Write\w*|Trace\s*\.\s*Write\w*|MessageBox\s*\.\s*Show|File\s*\.\s*AppendAllText\w*)\s*\(/g)) {
+      const open = from + (m.index ?? 0) + m[0].length - 1
+      const len = argsAt(code, open).length
+      const argsCode = code.slice(open + 1, open + 1 + len)
+      const argsRaw = text.slice(open + 1, open + 1 + len)
+      const holes = [...argsRaw.matchAll(/(?:\$+@?|@\$+)("(?:"")?)[\s\S]*?\1/g)].flatMap(s => [...(s[0] ?? '').matchAll(/\{([^{}:]+)[^{}]*\}/g)].map(h => h[1] ?? ''))
+      // Nur "gesetzt oder nicht" (Länge, Anzahl, null-Vergleich) verrät den Wert nicht.
+      const ohneLaenge = [argsCode, ...holes]
+        .join(' ')
+        .replace(/\bnameof\s*\([^)]*\)|[\w.]+\s*\??\.\s*(?:Length|Count)\b[^,;)]*|\bstring\s*\.\s*IsNullOr\w+\s*\([^)]*\)|[\w.]+\s*(?:is\s+(?:not\s+)?null|[!=]=\s*null)/g, ' ')
+      const names = [...ohneLaenge.matchAll(SECRET_NAME)].map(x => x[0]).filter(n => !SECRET_HARMLESS.test(n) && !/^(?:cancellation|stopping)/i.test(n))
+      if (names.length > 0) {
+        out.push(threat(text, file, open, 'R10', false,
+          `«${names[0]}» steht in einem Protokoll oder einer Meldung – ein Geheimnis landet so im Klartext in Dateien oder Bildschirmfotos. Nie den Wert ausgeben, höchstens "gesetzt/nicht gesetzt".`,
+          `«${names[0]}» is written to a log or message – a secret ends up in plain text in files or screenshots. Never output the value, at most "set/not set".`))
+        break
+      }
+    }
+  }
+  return out.filter((x): x is ThreatFinding => x !== undefined)
+}
+
+// Die schweren Bedrohungen (Fehler) für die Prüfung beim Schreiben und im Scan; alle Bedrohungen für das Härtungsprotokoll.
+export function csThreatFindings(text: string, file: string): ThreatFinding[] {
+  return csThreats(text, blankCode(text), file).sort((a, b) => a.line - b.line)
 }
 
 // ---- KI-Fehlerarten: häufige Fehler in KI-geschriebenem Code (eingebaute Geheimnisse, Debug-Reste und Merkposten, stille
@@ -309,4 +633,4 @@ export function kiBefunde(written: string, file: string): KiBefund[] {
   return befunde
 }
 
-export const hardeningChecks = { csHardeningHints, kiBefunde, kiPruefbar, kiMaxZeichen: KI_MAX_ZEICHEN }
+export const hardeningChecks = { csHardeningHints, csThreatFindings, kiBefunde, kiPruefbar, kiMaxZeichen: KI_MAX_ZEICHEN }

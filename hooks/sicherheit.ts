@@ -260,8 +260,10 @@ export async function scannen(u: Umgebung, file: string, text: string | undefine
     luecken.push(t(`${name} fehlt (einmalig: ${befehl})`, `${name} missing (once: ${befehl})`))
   // Gitleaks schreibt seine Fehlermeldung mit Farbcodes (gemessen 20.11.2026): die gehören nicht in die Meldung.
   const kaputt = (name: string, grund: string) => luecken.push(t(`${name} lief nicht: ${rein(grund, 200)}`, `${name} did not run: ${rein(grund, 200)}`))
-  const auftrag = (name: string, job: () => Promise<void>) =>
-    job().catch((err: unknown) => kaputt(name, String((err as { message?: string })?.message ?? err)))
+  const auftrag = (name: string, job: () => Promise<void>): Promise<void> =>
+    job().catch((err: unknown) => {
+      kaputt(name, String((err as { message?: string })?.message ?? err))
+    })
   const zeilen = (text ?? '').split(/\r?\n/)
 
   const jobs: Promise<void>[] = []

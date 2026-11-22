@@ -978,7 +978,7 @@ test('/scan lässt Ordner mit .code-waechter-auslassen samt Unterordnern aus und
       'D:\\mk\\SteamCMD\\tief': [fileEntry('auch_fremd.py')],
       'D:\\mk\\eigen': [fileEntry('mein.py')],
     }
-    return { value: v[e.path] ?? [] }
+    return { value: (v[e.path] ?? []) as never }
   })
   const writes: { path: string; text: string }[] = []
   on('fs.write', (_$, e) => {
@@ -1248,8 +1248,8 @@ test('Aufräumen beim Start: ein Ordner gilt erst als alt, wenn auch keine Datei
   withTemp(on)
   mock.clock(on)
   on('fs.exists', () => ({ value: true }))
-  on('command.register', () => ({ value: undefined }))
-  on('ui.open', () => ({ value: undefined }))
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: undefined }) as never)
   on('session.start', (_$, e) => e as never)
   on('tool.call', () => toolAnswer as never)
   on('fs.write', () => ({ value: undefined }))
@@ -4468,4 +4468,1127 @@ test('Sicherheits-Scanner: ein roter Bandit-Fund bleibt rot, auch wenn Ruff dies
 
   expect(text).toContain('✖ «b.py»')
   expect(text).toContain('B602')
+})
+
+// ====================================================================================== Binärdateien
+// Binärdateien werden nicht geprüft. Eine Datei mit einem Nullbyte in den ersten 8000 Bytes ist keine Textdatei
+// (ausser mit der Kennung von UTF-16/UTF-32 am Anfang). Anlass: ein Spielmodell mit der Endung .mesh (Kopf "hsem", viele Nullbytes)
+// wurde als GLSL-Mesh-Shader übersetzt und rot gemeldet. Die Bytes kommen hier wie vom echten Lesezugriff als { base64 }.
+const zeichen = (s: string): number[] => [...s].map(c => c.charCodeAt(0))
+const alsBytes = (b: number[]) => ({ base64: (new Uint8Array(b) as any).toBase64() as string })
+const MODELL = [...zeichen('hsem'), 6, 0, 0, 0, 0, 0, 0, 0, ...zeichen(' -1,0c, '), 0, 0, 0x80, 0x3f]
+const BREIT = (s: string): number[] => [...s].flatMap(c => [c.charCodeAt(0), 0]) // UTF-16 LE ohne Kennung
+
+function bytePlatte(on: On, projects: string, dateien: Record<string, number[]>) {
+  on('env.get', (_$, e) => ({ value: e.name === 'TEMP' ? 'C:\\Temp' : e.name === 'USERPROFILE' ? 'C:\\Users\\Probe' : undefined }))
+  on('fs.read', (_$, e) => {
+    if (e.path.endsWith('Projekte.txt')) return { value: projects }
+    const b = dateien[e.path]
+    if (b === undefined) return { deny: 'Datei nicht da' } as never
+    return { value: (e.as === 'bytes' ? alsBytes(b.slice(e.offset ?? 0, (e.offset ?? 0) + (e.length ?? b.length))) : String.fromCharCode(...b)) as never }
+  })
+}
+
+// Welche .py-, .mesh- und .ps1-Dateien ein Prüfprogramm bekam (als Argument oder, wie bei PowerShell, in CW_FILE); jede gilt als
+// fehlerfrei.
+function byteLaeufe(on: On): string[] {
+  const geprueft: string[] = []
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: '20.11.2026 18:00:00,00\r\n' } }
+    const env = ((e as { init?: { env?: Record<string, unknown> } }).init?.env ?? {}) as Record<string, unknown>
+    for (const x of [...a, String(env.CW_FILE ?? '')]) if (/\.(py|mesh|ps1)$/i.test(x)) geprueft.push(x)
+    return { value: done }
+  })
+  return geprueft
+}
+
+test('Binärdatei mit Quelltext-Endung wird beim Schreiben nicht geprüft; dieselbe Endung als Text wird geprüft (Gegenprobe)', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  bytePlatte(on, '', { 'D:\\p\\modell.py': MODELL, 'D:\\p\\echt.py': zeichen('x = 1\n') })
+  const geprueft = byteLaeufe(on)
+
+  const bin = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\modell.py', content: 'x' })).context ?? []).join('\n')
+  expect(bin).toContain('Code-Wächter – «modell.py»: Binärdatei (Nullbytes, keine Textdatei), nicht geprüft.')
+  expect(geprueft.some(f => /modell\.py$/i.test(f))).toBe(false)
+
+  const txt = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\echt.py', content: 'x' })).context ?? []).join('\n')
+  expect(txt).not.toContain('Binärdatei')
+  expect(geprueft.some(f => /echt\.py$/i.test(f))).toBe(true)
+})
+
+test('Binärdatei: UTF-16 mit Kennung FF FE ist Text und wird geprüft; ohne Kennung zählt sie als Binärdatei (Gegenprobe)', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  bytePlatte(on, '', { 'D:\\p\\breit.ps1': [0xff, 0xfe, ...BREIT('$x = 1\r\n')], 'D:\\p\\ohne.ps1': BREIT('$x = 1\r\n') })
+  const geprueft = byteLaeufe(on)
+
+  const breit = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\breit.ps1', content: 'x' })).context ?? []).join('\n')
+  expect(breit).not.toContain('Binärdatei')
+  expect(geprueft.some(f => /breit\.ps1$/i.test(f))).toBe(true)
+
+  const ohne = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\p\\ohne.ps1', content: 'x' })).context ?? []).join('\n')
+  expect(ohne).toContain('Binärdatei')
+  expect(geprueft.some(f => /ohne\.ps1$/i.test(f))).toBe(false)
+})
+
+test('/scan übergeht Binärdateien und NuGet-Pakete, nennt die Binärdateien im Bericht; eigene Pakete bleiben geprüft (Gegenprobe)', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  bytePlatte(on, 'Binaer | D:\\bp |\n', {
+    'D:\\bp\\Modell.mesh': MODELL,
+    'D:\\bp\\a.py': zeichen('x = 1\n'),
+    'D:\\bp\\packages\\Newtonsoft.Json.13.0.3\\install.py': zeichen('x = 1\n'),
+    'D:\\bp\\Packages\\com.firma.paket\\eigen.py': zeichen('x = 1\n'),
+  })
+  const listed: string[] = []
+  on('fs.list', (_$, e) => {
+    listed.push(e.path)
+    const v: Record<string, unknown[]> = {
+      'D:\\bp': [fileEntry('Modell.mesh'), fileEntry('a.py'), dirEntry('packages'), dirEntry('Packages')],
+      'D:\\bp\\packages': [dirEntry('Newtonsoft.Json.13.0.3')],
+      'D:\\bp\\packages\\Newtonsoft.Json.13.0.3': [fileEntry('install.py')],
+      'D:\\bp\\Packages': [dirEntry('com.firma.paket')],
+      'D:\\bp\\Packages\\com.firma.paket': [fileEntry('eigen.py')],
+    }
+    return { value: (v[e.path] ?? []) as never }
+  })
+  const writes: { path: string; text: string }[] = []
+  on('fs.write', (_$, e) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
+  const geprueft = byteLaeufe(on)
+  on('session.send', () => ({ isDelivered: true }))
+  on('ui.toast', () => ({ value: undefined }))
+
+  await $.command.run({ command: 'scan', args: 'Binaer' } as never)
+  const result = await scanResult($, 'Scan Binaer')
+  const report = writes.find(w => w.path.endsWith('Binaer_Fehlerbericht.txt'))?.text ?? ''
+
+  expect(geprueft.some(f => /Modell\.mesh$/i.test(f))).toBe(false)
+  expect(report).toContain('Übergangen: 1 Binärdatei (keine Textdateien, Liste unten)')
+  expect(report).toContain('ÜBERGANGEN: BINÄRDATEIEN')
+  expect(report).toContain('«Modell.mesh»')
+  expect(result).toContain('Übergangen: 1 Binärdatei (Liste im Bericht)')
+  expect(result).toContain('keine Fehler')
+  // NuGet-Ablage: nicht gelesen, nicht geprüft. Eigenes Paket und die Textdatei daneben: geprüft.
+  expect(listed).not.toContain('D:\\bp\\packages\\Newtonsoft.Json.13.0.3')
+  expect(geprueft.some(f => /install\.py$/i.test(f))).toBe(false)
+  expect(geprueft.some(f => /eigen\.py$/i.test(f))).toBe(true)
+  expect(geprueft.some(f => /\\a\.py$/i.test(f))).toBe(true)
+  // Seitenleiste: keine Zeile für die Binärdatei und keine Dateiart "Shader" (die einzige .mesh war binär).
+  const ui = await $.ui.mount({ plugin: 'code-waechter', component: 'Pane', requestId: 'code-waechter', surface: 'desktop', props: {} } as never)
+  expect(await ui.find({ type: 'Text', text: /Modell\.mesh/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /Shader/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /Python/ })).not.toBe(undefined)
+  await ui.unmount()
+})
+
+// ====================================================================================== Festfressende Regeln, Netzwerkpfade
+// Gemessen 20.11.2026: CA5390 und CA5403 liessen den Übersetzer bei zwei Prüfprojekten hängen
+// (bekannter Fehler der .NET-Analyse, dotnet/sdk#56280). Sie bleiben an, rechnen aber nicht über Methodengrenzen und lassen das
+// Hauptprogramm ohne Methode (<Main>$) aus; hängt ein Bau trotzdem, übersetzt der Wächter ohne die zwei neu und sagt das offen.
+const eben = (p: string): string => p.replace(/\\/g, '/').toLowerCase()
+const PROPS_SCHALTER = '-p:CustomBeforeMicrosoftCommonProps='
+
+// Die .globalconfig, die ein Bauaufruf über seine Einstellungsdatei mitliest (aus den gespielten Schreibvorgängen).
+function regelnVon(argv: readonly string[], geschrieben: Record<string, string>): string {
+  const props = argv.find(x => x.startsWith(PROPS_SCHALTER))?.slice(PROPS_SCHALTER.length) ?? ''
+  const inhalt = geschrieben[eben(props)] ?? ''
+  return geschrieben[eben(/Include="([^"]+)"/.exec(inhalt)?.[1] ?? '')] ?? ''
+}
+
+// Gespieltes C#-Projekt D:\Proj mit A.cs; bau(argv, nr) beantwortet jeden dotnet-build-Aufruf.
+function bauProjekt(on: On, bau: (argv: string[], nr: number) => unknown) {
+  on('tool.call', () => toolAnswer as never)
+  on('fs.list', () => ({ value: projectList }))
+  on('fs.read', () => ({ value: 'class A { }\n' }))
+  const geschrieben: Record<string, string> = {}
+  on('fs.write', (_$, e) => {
+    geschrieben[eben(e.path)] = String(e.text)
+    return { value: undefined }
+  })
+  const baue: string[][] = []
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (a.includes('msbuild')) return { value: { ...done, stdout: JSON.stringify({ Items: { Compile: [{ FullPath: 'D:\\Proj\\A.cs' }] } }) } }
+    if (a.includes('build') && a.includes('--no-restore')) {
+      baue.push(a)
+      return bau(a, baue.length) as never
+    }
+    return { value: done }
+  })
+  return { geschrieben, baue }
+}
+
+test('C#-Bau: CA5390 und CA5403 bleiben an, ohne Rechnung über Methodengrenzen und ohne das Hauptprogramm <Main>$', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { geschrieben, baue } = bauProjekt(on, () => ({ value: done }))
+
+  const ran = await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: 'x' })
+
+  expect((ran.context ?? []).join('\n')).toContain('✔ «A.cs»')
+  expect(baue.length).toBe(1)
+  expect(baue[0]).toContain('-p:AnalysisModeSecurity=All')
+  const regeln = regelnVon(baue[0] ?? [], geschrieben)
+  expect(regeln).toContain('is_global = true')
+  for (const r of ['CA5390', 'CA5403']) {
+    expect(regeln).toContain(`dotnet_code_quality.${r}.interprocedural_analysis_kind = None`)
+    expect(regeln).toContain(`dotnet_code_quality.${r}.excluded_symbol_names = <Main>$`)
+  }
+  // Keine Regel ist abgeschaltet: jede abgeschaltete Regel wäre eine stille Lücke.
+  expect(regeln).not.toContain('severity = none')
+  expect(regeln.trim().split('\n').length).toBe(5)
+})
+
+test('C#-Bau: hängt der Bau bis zur Zeitgrenze, übersetzt der Wächter ohne CA5390/CA5403 neu und sagt das offen; ein anderer Fehler baut nicht neu (Gegenprobe)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  // Eigene Uhr: der erste Bau "dauert" 200 s und wird abgebrochen (wie an der Zeitgrenze von 180 s).
+  let jetzt = 1_000_000
+  on('clock.now', () => ({ value: jetzt }))
+  let haengen = true
+  const { geschrieben, baue } = bauProjekt(on, (_a, nr) => {
+    if (nr === 1 && haengen) {
+      jetzt += 200_000
+      return { deny: 'abgebrochen' }
+    }
+    if (nr === 1) return { deny: 'dotnet fehlt' }
+    return { value: done }
+  })
+
+  const text = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: 'x' })).context ?? []).join('\n')
+
+  expect(baue.length).toBe(2)
+  expect(regelnVon(baue[0] ?? [], geschrieben)).toContain('dotnet_code_quality.CA5390.interprocedural_analysis_kind = None')
+  const ohne = regelnVon(baue[1] ?? [], geschrieben)
+  expect(ohne).toContain('dotnet_diagnostic.CA5390.severity = none')
+  expect(ohne).toContain('dotnet_diagnostic.CA5403.severity = none')
+  expect(text).toContain('✔ «A.cs»')
+  expect(text).toContain('CA5390 und CA5403 (eingebaute Schlüssel und Zertifikate) nicht geprüft')
+
+  // Gegenprobe: scheitert der Bau sofort (kein Hängen), wird nicht ohne die Regeln neu übersetzt.
+  haengen = false
+  baue.length = 0
+  const fehler = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: 'y' })).context ?? []).join('\n')
+  expect(baue.length).toBe(1)
+  expect(fehler).not.toContain('CA5390 und CA5403')
+})
+
+// Gemessen 20.11.2026: ein Fehler in einer Datei, die ein Befehl über \\localhost\C$\... schrieb, blieb ohne Meldung; derselbe über
+// C:\... wurde gemeldet. Die Mod kann auf Netzwerkpfaden nicht nachsehen: offen NICHT GEPRÜFT statt still.
+test('Befehl schreibt über einen Netzwerkpfad: offen NICHT GEPRÜFT samt Seitenleiste; ein lokaler Pfad, den es nicht gibt, bleibt still (Gegenprobe)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.stat', () => ({ deny: 'nicht lesbar' }) as never)
+  const laeufe: string[] = []
+  on('process.run', (_$, e) => {
+    laeufe.push(e.argv.map(String).join(' '))
+    return { value: done }
+  })
+
+  const netz = ((await $.tool.call({ tool: 'PowerShell', command: 'Set-Content -Path "\\\\srv\\Freigabe\\p\\probe.py" -Value "foo("' })).context ?? []).join('\n')
+  expect(netz).toContain('«probe.py»: NICHT GEPRÜFT – Netzwerkpfad «\\\\srv\\Freigabe\\p\\probe.py»')
+  expect(laeufe.some(l => /probe\.py/i.test(l))).toBe(false)
+
+  const lokal = await $.tool.call({ tool: 'PowerShell', command: 'Set-Content -Path "D:\\p\\weg.py" -Value "x"' })
+  expect(lokal.context).toBeUndefined()
+
+  const ui = await $.ui.mount({ plugin: 'code-waechter', component: 'Pane', requestId: 'code-waechter', surface: 'desktop', props: {} } as never)
+  expect(await ui.find({ type: 'Text', text: /Netzwerkpfad/ })).not.toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /weg\.py/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+// ====================================================================================== C# allein übersetzen
+// Eine C#-Datei, die kein Projekt übersetzt (kein Projekt, oder vom Projekt ausgeschlossen, z. B. eine Ersatzdatei mit Compile
+// Remove), wird allein in einem Übergangsprojekt übersetzt statt nur auf Schreibweise geprüft.
+type LoseAntwort = (projekt: string, argv: string[]) => unknown
+// opt.einstellungen: Antwort auf 'dotnet msbuild -getProperty/-getItem' (Standard: net10.0-windows mit WPF); opt.projektBau: Antwort auf
+// den Bau des Projekts selbst (--no-restore).
+type LoseOpt = { einstellungen?: (argv: string[]) => unknown; projektBau?: () => unknown }
+function loseBau(on: On, liste: (dir: string) => { name: string; kind: 'file' | 'directory'; isLink?: boolean }[], antwort: LoseAntwort, opt: LoseOpt = {}) {
+  on('tool.call', () => toolAnswer as never)
+  on('fs.list', (_$, e) => ({ value: liste(String(e.path)).map(x => ({ size: 1, mtimeMs: 0, isLink: false, ...x })) as never }))
+  on('fs.read', () => ({ value: 'class A { }\n' }))
+  const geschrieben: Record<string, string> = {}
+  on('fs.write', (_$, e) => {
+    geschrieben[eben(e.path)] = String(e.text)
+    return { value: undefined }
+  })
+  const lose: string[] = []
+  const versionOrdner: string[] = []
+  const einstellungsAufrufe: string[][] = []
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (a.includes('--version')) {
+      versionOrdner.push(String((e as { init?: { cwd?: string } }).init?.cwd ?? ''))
+      return { value: { ...done, stdout: '10.0.402\r\n' } }
+    }
+    if (a.some(x => x.startsWith('-getProperty:'))) einstellungsAufrufe.push(a)
+    if (a.some(x => x.startsWith('-getProperty:')) && opt.einstellungen) return opt.einstellungen(a) as never
+    if (a.includes('build') && a.includes('--no-restore') && opt.projektBau) return opt.projektBau() as never
+    if (a.some(x => x.startsWith('-getProperty:'))) return { value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: 'net10.0-windows', UseWPF: 'true', ImplicitUsings: 'enable' } }) } }
+    if (a.includes('msbuild')) return { value: { ...done, stdout: JSON.stringify({ Items: { Compile: [{ FullPath: 'D:\\Proj\\Andere.cs' }] } }) } }
+    if (a.includes('build') && !a.includes('--no-restore')) {
+      const projekt = geschrieben[eben(a[a.length - 1] ?? '')] ?? ''
+      lose.push(projekt)
+      return antwort(projekt, a) as never
+    }
+    return { value: done }
+  })
+  return { geschrieben, lose, versionOrdner, einstellungsAufrufe }
+}
+
+test('C# allein: eine vom Projekt ausgeschlossene Datei wird mit dessen Einstellungen allein übersetzt; ein Fehler darin wird rot (Gegenprobe)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let fehler = false
+  const { lose } = loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' }], () =>
+    fehler
+      ? { value: { ...done, exitCode: 1, stdout: "D:\\Proj\\B.cs(3,5): error CS0117: 'RSA' does not contain a definition for 'Erzeuge' [C:\\Temp\\lose.csproj]\r\n" } }
+      : { value: done },
+  )
+
+  const gut = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\B.cs', content: 'x' })).context ?? []).join('\n')
+  expect(gut).toContain('✔ «B.cs»')
+  expect(gut).toContain('allein')
+  expect(gut).not.toContain('NICHT GEPRÜFT')
+  expect(lose.length).toBe(1)
+  expect(lose[0]).toContain('<Compile Include="D:\\Proj\\B.cs" />')
+  expect(lose[0]).toContain('<TargetFramework>net10.0-windows</TargetFramework>')
+  expect(lose[0]).toContain('<UseWPF>true</UseWPF>')
+  expect(lose[0]).toContain('<EnableDefaultItems>false</EnableDefaultItems>')
+
+  fehler = true
+  const rot = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\B.cs', content: 'y' })).context ?? []).join('\n')
+  expect(rot).toContain('✖ «B.cs»')
+  expect(rot).toContain('CS0117')
+})
+
+test('C# allein ohne Projekt: fehlt ein Name, kommen die übrigen C#-Dateien des Ordners dazu; bleibt er unbekannt, steht das offen', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let auchZusammen = false
+  const unbekannt = { value: { ...done, exitCode: 1, stdout: "D:\\Lose\\A.cs(2,1): error CS0246: The type or namespace name 'Helfer' could not be found [x]\r\n" } }
+  const { lose } = loseBau(
+    on,
+    dir => (/^D:\\Lose$/i.test(dir) ? [{ name: 'A.cs', kind: 'file' }, { name: 'B.cs', kind: 'file' }] : []),
+    projekt => (!projekt.includes('B.cs') || auchZusammen ? unbekannt : { value: done }),
+  )
+
+  const gut = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'x' })).context ?? []).join('\n')
+  // Allein, allein mit den impliziten usings von .NET (es fehlte ein Name), dann mit dem Ordner.
+  expect(lose.length).toBe(3)
+  expect(lose[0]).not.toContain('B.cs')
+  expect(lose[0]).not.toContain('<ImplicitUsings>')
+  expect(lose[1]).toContain('<ImplicitUsings>enable</ImplicitUsings>')
+  expect(lose[2]).toContain('<Compile Include="D:\\Lose\\B.cs" />')
+  // Standardwerte ohne Projekt: die Hauptfassung des installierten SDK.
+  expect(lose[0]).toContain('<TargetFramework>net10.0</TargetFramework>')
+  expect(gut).toContain('✔ «A.cs»')
+  expect(gut).toContain('1 weiteren C#-Dateien')
+  expect(gut).not.toContain('Helfer')
+
+  // Gegenprobe: auch zusammen unbekannt -> kein Rot, aber offen genannt, nie ein ✔ ohne Hinweis.
+  auchZusammen = true
+  const offen = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'y' })).context ?? []).join('\n')
+  expect(offen).not.toContain('✖')
+  expect(offen).toContain('Helfer')
+  expect(offen).toContain('auch mit den übrigen C#-Dateien des Ordners unbekannt')
+  // Der gemeinsame Lauf kam nicht bis zu den Methodenrümpfen (kein CS5001): das steht dabei.
+  expect(offen).toContain('Methodenrümpfe der Datei sind dann nicht geprüft')
+})
+
+test('C# allein: zwei Fassungen derselben Klasse im Ordner (doppelt definiert) zählen nicht als Fehler, ein echter Fehler allein schon', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let echt = false
+  const hilfe = "D:\\Lose\\Ersatz.cs(2,1): error CS0246: The type or namespace name 'Hilfe' could not be found [x]\r\n"
+  loseBau(
+    on,
+    dir => (/^D:\\Lose$/i.test(dir) ? [{ name: 'Ersatz.cs', kind: 'file' }, { name: 'Original.cs', kind: 'file' }] : []),
+    projekt =>
+      projekt.includes('Original.cs')
+        ? { value: { ...done, exitCode: 1, stdout: "D:\\Lose\\Ersatz.cs(5,25): error CS0101: The namespace 'X' already contains a definition for 'Tpm' [x]\r\n" } }
+        : { value: { ...done, exitCode: 1, stdout: echt ? `D:\\Lose\\Ersatz.cs(9,3): error CS0117: 'RSA' does not contain a definition for 'Erzeuge' [x]\r\n${hilfe}` : hilfe } },
+  )
+
+  const gelb = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\Ersatz.cs', content: 'x' })).context ?? []).join('\n')
+  expect(gelb).not.toContain('✖')
+  expect(gelb).not.toContain('CS0101')
+  expect(gelb).toContain('Hilfe')
+
+  echt = true
+  const rot = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\Ersatz.cs', content: 'y' })).context ?? []).join('\n')
+  expect(rot).toContain('✖ «Ersatz.cs»')
+  expect(rot).toContain('CS0117')
+})
+
+test('C# allein: ein Fehler beim Wiederherstellen (nicht vom C#-Übersetzer) ist nie ✔, dann bleibt die Schreibweise', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, () => [], () => ({ value: { ...done, exitCode: 1, stdout: 'C:\\Program Files\\dotnet\\sdk\\x.targets(166,5): error NETSDK1045: The current .NET SDK does not support targeting .NET 99.0. [x]\r\n' } }))
+
+  const text = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'x' })).context ?? []).join('\n')
+  // Die Meldung des Bauprogramms nennt eine andere Datei (x.targets): ohne die Prüfung auf Fehler, die nicht vom C#-Übersetzer
+  // kommen, gälte die Datei als fehlerfrei. In dieser Testumgebung fehlt auch der Syntaxprüfer: dann offen NICHT GEPRÜFT.
+  expect(text).toContain('NICHT GEPRÜFT')
+  expect(text).not.toContain('✔')
+})
+
+// Unabhängige Gegenprüfung: die Fälle, in denen die erste Fassung ein falsches ✔ oder ein falsches Rot gegeben hätte.
+test('C# allein: Fehler ohne Zeilenangabe (CS1617) und gekappte Ausgabe sind nie ✔', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let fall: 'ohneZeile' | 'gekappt' = 'ohneZeile'
+  loseBau(on, () => [], () =>
+    fall === 'ohneZeile'
+      ? { value: { ...done, exitCode: 1, stdout: "CSC : error CS1617: Invalid option '99.0' for /langversion [x]\r\n" } }
+      : { value: { ...done, isStdoutTruncated: true } },
+  )
+
+  const ohneZeile = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'x' })).context ?? []).join('\n')
+  expect(ohneZeile).not.toContain('✔')
+  expect(ohneZeile).toContain('NICHT GEPRÜFT')
+
+  fall = 'gekappt'
+  const gekappt = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'y' })).context ?? []).join('\n')
+  expect(gekappt).not.toContain('✔')
+  expect(gekappt).toContain('NICHT GEPRÜFT')
+})
+
+test('C# allein: zwei eigenständige Programme im Ordner (CS8802) und ein Ersatz neben partial (CS0260) werden nicht rot', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let code = 'CS8802'
+  loseBau(
+    on,
+    dir => (/^D:\\Lose$/i.test(dir) ? [{ name: 'A.cs', kind: 'file' }, { name: 'B.cs', kind: 'file' }] : []),
+    projekt =>
+      projekt.includes('B.cs')
+        ? { value: { ...done, exitCode: 1, stdout: `D:\\Lose\\A.cs(1,1): error ${code}: Only one compilation unit can have top-level statements. [x]\r\nD:\\Lose\\A.cs(4,9): error CS0117: 'X' does not contain a definition for 'Y' [x]\r\n` } }
+        : { value: { ...done, exitCode: 1, stdout: "D:\\Lose\\A.cs(2,1): error CS0246: The type or namespace name 'Helfer' could not be found [x]\r\n" } },
+  )
+
+  const zwei = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'x' })).context ?? []).join('\n')
+  expect(zwei).not.toContain('✖')
+  expect(zwei).toContain('Helfer')
+
+  code = 'CS0260'
+  const partial = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'y' })).context ?? []).join('\n')
+  expect(partial).not.toContain('✖')
+  expect(partial).toContain('Helfer')
+})
+
+test('C# allein ohne Projekt: ein Fehler, den nur der Lauf mit dem Ordner meldet, wird offen genannt, nicht rot', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(
+    on,
+    dir => (/^D:\\Lose$/i.test(dir) ? [{ name: 'A.cs', kind: 'file' }, { name: 'Config.cs', kind: 'file' }] : []),
+    projekt =>
+      projekt.includes('Config.cs')
+        ? { value: { ...done, exitCode: 1, stdout: "D:\\Lose\\A.cs(7,5): error CS0117: 'Config' does not contain a definition for 'Load' [x]\r\n" } }
+        : { value: { ...done, exitCode: 1, stdout: "D:\\Lose\\A.cs(7,5): error CS0103: The name 'Config' does not exist in the current context [x]\r\n" } },
+  )
+
+  const text = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'x' })).context ?? []).join('\n')
+  expect(text).not.toContain('✖')
+  expect(text).toContain('allein nicht prüfbar')
+  expect(text).toContain('CS0117')
+})
+
+test('C# allein: vom Projekt ausgeschlossen, fehlt ein Name, kommen die Dateien des Projekts dazu (nicht der Ordner); ein Fehler dort ist rot', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { lose } = loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' }, { name: 'Nachbar.cs', kind: 'file' }], projekt =>
+    projekt.includes('andere.cs')
+      ? { value: { ...done, exitCode: 1, stdout: "D:\\Proj\\B.cs(4,9): error CS1061: 'string' does not contain a definition for 'Lenght' [x]\r\n" } }
+      : { value: { ...done, exitCode: 1, stdout: "D:\\Proj\\B.cs(2,1): error CS0246: The type or namespace name 'Hilfe' could not be found [x]\r\n" } },
+  )
+
+  const text = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\B.cs', content: 'x' })).context ?? []).join('\n')
+  expect(lose.length).toBe(2)
+  expect(lose[1]).toContain('<Compile Include="d:\\proj\\andere.cs" />')
+  expect(lose[1]).not.toContain('Nachbar.cs')
+  expect(text).toContain('✖ «B.cs»')
+  expect(text).toContain('CS1061')
+})
+
+test('C# allein: "&" und "$" im Pfad ergeben gültiges XML ohne MSBuild-Ausdruck', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { lose } = loseBau(on, () => [], () => ({ value: done }))
+
+  await $.tool.call({ tool: 'Write', file_path: 'D:\\Tom & Jerry\\$(Weg);x\\A.cs', content: 'x' })
+  expect(lose[0]).toContain('<Compile Include="D:\\Tom &amp; Jerry\\%24(Weg)%3Bx\\A.cs" />')
+})
+
+test('/scan: lose C#-Dateien eines Ordners ohne Projekt werden einmal zusammen übersetzt, nicht je Datei', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\Probe' : e.name === 'TEMP' ? 'C:\\Temp' : undefined }))
+  on('fs.stat', (_$, e) => ({ value: { kind: /\.\w+$/.test(e.path) ? ('file' as const) : ('dir' as const), size: 1, mtimeMs: 0, isLink: false } }))
+  const { lose } = loseBau(
+    on,
+    dir => (/^D:\\Lose$/i.test(dir) ? ['A.cs', 'B.cs', 'C.cs'].map(name => ({ name, kind: 'file' as const })) : []),
+    () => ({ value: done }),
+  )
+
+  await $.command.run({ command: 'scan', args: 'D:\\Lose' } as never)
+  let result = ''
+  for (let k = 0; k < 10 && !result; k++) result = await scanResult($, 'Scan Lose')
+
+  expect(lose.length).toBe(1)
+  for (const n of ['A.cs', 'B.cs', 'C.cs']) expect(lose[0]).toContain(`D:\\Lose\\${n}`)
+  expect(result).toContain('keine Fehler')
+  expect(result).not.toContain('eingeschränkt')
+})
+
+test('C# allein: scheitert der Lauf mit dem Ordner am Wiederherstellen, zählt er nicht als sauber; es gilt der Lauf allein', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(
+    on,
+    dir => (/^D:\\Lose$/i.test(dir) ? [{ name: 'A.cs', kind: 'file' }, { name: 'B.cs', kind: 'file' }] : []),
+    projekt =>
+      projekt.includes('B.cs')
+        ? { value: { ...done, exitCode: 1, stdout: 'C:\\Program Files\\dotnet\\sdk\\x.targets(166,5): error NETSDK1045: The current .NET SDK does not support targeting .NET 99.0. [x]\r\n' } }
+        : { value: { ...done, exitCode: 1, stdout: "D:\\Lose\\A.cs(2,1): error CS0246: The type or namespace name 'Helfer' could not be found [x]\r\n" } },
+  )
+
+  const text = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Lose\\A.cs', content: 'x' })).context ?? []).join('\n')
+  expect(text).not.toContain('weiteren C#-Dateien')
+  expect(text).toContain('Helfer')
+})
+
+// Zweite unabhängige Gegenprüfung: bestätigte Befunde und Testlücken.
+const nurFehler = (stdout: string) => ({ value: { ...done, exitCode: 1, stdout } })
+const ORDNER_AB = (dir: string) => (/^D:\\Lose$/i.test(dir) ? [{ name: 'A.cs', kind: 'file' as const }, { name: 'B.cs', kind: 'file' as const }] : [])
+const ohneMain = "CSC : error CS5001: Program does not contain a static 'Main' method suitable for an entry point [C:\\Temp\\lose.csproj]\r\n"
+const kontext = async ($: any, datei: string, inhalt = 'x'): Promise<string> => ((await $.tool.call({ tool: 'Write', file_path: datei, content: inhalt })).context ?? []).join('\n')
+
+test('C# allein: hat der gemeinsame Lauf einen Fehler in einer anderen Datei, ersetzt er nie das Rot des Laufs allein (gemessen: .NET übersetzt dann die Datei nicht)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, ORDNER_AB, projekt =>
+    projekt.includes('B.cs')
+      ? nurFehler('D:\\Lose\\B.cs(1,39): error CS1002: ; expected [x]\r\n')
+      : nurFehler("D:\\Lose\\A.cs(1,64): error CS0029: Cannot implicitly convert type 'string' to 'int' [x]\r\nD:\\Lose\\A.cs(1,31): error CS0246: The type or namespace name 'Helfer' could not be found [x]\r\n"),
+  )
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  expect(text).toContain('✖ «A.cs»')
+  expect(text).toContain('CS0029')
+})
+
+test('/scan ohne Projekt: ein Fehler in einer anderen Datei des Ordners macht keine Datei ✔, die allein einen Fehler hat', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\Probe' : e.name === 'TEMP' ? 'C:\\Temp' : undefined }))
+  on('fs.stat', (_$, e) => ({ value: { kind: /\.\w+$/.test(e.path) ? ('file' as const) : ('dir' as const), size: 1, mtimeMs: 0, isLink: false } }))
+  const { geschrieben } = loseBau(on, ORDNER_AB, projekt =>
+    projekt.includes('B.cs') && projekt.includes('A.cs')
+      ? nurFehler('D:\\Lose\\B.cs(1,39): error CS1002: ; expected [x]\r\n')
+      : projekt.includes('A.cs')
+        ? nurFehler("D:\\Lose\\A.cs(1,64): error CS0029: Cannot implicitly convert type 'string' to 'int' [x]\r\n")
+        : nurFehler('D:\\Lose\\B.cs(1,39): error CS1002: ; expected [x]\r\n'),
+  )
+
+  await $.command.run({ command: 'scan', args: 'D:\\Lose' } as never)
+  let ergebnis = ''
+  for (let k = 0; k < 10 && !ergebnis; k++) ergebnis = await scanResult($, 'Scan Lose')
+  const report = Object.entries(geschrieben).find(([k]) => k.endsWith('fehlerbericht.txt'))?.[1] ?? ''
+  expect(ergebnis).toContain('2 Fehler in 2 Dateien')
+  expect(report).toContain('A.cs')
+  expect(report).toContain('CS0029')
+})
+
+test('C# allein: nennt der Übersetzer allein eine andere Datei (#line), steht offen NICHT GEPRÜFT', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, () => [], () => nurFehler("D:\\Lose\\Vorlage.tt(10,9): error CS0029: Cannot implicitly convert type 'string' to 'int' [x]\r\n"))
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  // Danach fällt die Prüfung auf die Schreibweise zurück (in dieser Testumgebung ohne Syntaxprüfer): nie ✔.
+  expect(text).not.toContain('✔')
+  expect(text).toContain('NICHT GEPRÜFT')
+})
+
+test('C# allein: fehlt ein Name und kam .NET nicht bis zu den Methodenrümpfen (kein CS5001), sagt der Hinweis das; mit CS5001 nicht', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let mitMain = false
+  loseBau(on, () => [], () => nurFehler(`D:\\Lose\\A.cs(1,31): error CS0246: The type or namespace name 'EntityAlive' could not be found [x]\r\n${mitMain ? ohneMain : ''}`))
+
+  const ohne = await kontext($, 'D:\\Lose\\A.cs')
+  expect(ohne).toContain('EntityAlive')
+  expect(ohne).toContain('Methodenrümpfe der Datei sind dann nicht geprüft')
+
+  mitMain = true
+  const mit = await kontext($, 'D:\\Lose\\A.cs', 'y')
+  expect(mit).toContain('EntityAlive')
+  expect(mit).not.toContain('Methodenrümpfe')
+})
+
+test('C# allein: echte Antwort ohne Main (CS5001 ohne Zeile) ist ✔; zusammen mit einem Fehler der Datei ✖', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let fehler = false
+  loseBau(on, () => [], () => nurFehler(`${fehler ? "D:\\Lose\\A.cs(9,3): error CS0117: 'RSA' does not contain a definition for 'Erzeuge' [x]\r\n" : ''}${ohneMain}`))
+
+  expect(await kontext($, 'D:\\Lose\\A.cs')).toContain('✔ «A.cs»')
+  fehler = true
+  const rot = await kontext($, 'D:\\Lose\\A.cs', 'y')
+  expect(rot).toContain('✖ «A.cs»')
+  expect(rot).toContain('CS0117')
+})
+
+test('C# allein: was ein Quellgenerator ergänzt (CS9248, CS8795) und CS1069 (System.Drawing) werden gelb, nicht rot', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let code = 'CS9248'
+  loseBau(on, () => [], () => nurFehler(`D:\\Lose\\A.cs(3,5): error ${code}: Partial property 'Wert' must have an implementation part. [x]\r\n`))
+
+  for (const c of ['CS9248', 'CS8795', 'CS0759', 'CS9275', 'CS1069']) {
+    code = c
+    const text = await kontext($, 'D:\\Lose\\A.cs', c)
+    expect(text).not.toContain('✖')
+    expect(text).toContain('Wert')
+  }
+})
+
+test('C# allein ohne Projekt: Standard erlaubt unsafe, zuerst ohne implizite usings (sie machen gültigen Code mehrdeutig); das Projekt übergibt seine Using-Einträge; immer ein Programm (Exe)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let mitProjekt = false
+  const { lose } = loseBau(on, () => (mitProjekt ? [{ name: 'Mod.csproj', kind: 'file' as const }] : []), () => ({ value: done }), {
+    einstellungen: () => ({
+      value: {
+        ...done,
+        stdout: JSON.stringify({
+          Properties: { TargetFramework: 'net10.0', ImplicitUsings: 'enable', OutputType: 'Library' },
+          Items: { Using: [{ Identity: 'System' }, { Identity: 'System.Math', Static: 'true' }, { Identity: 'Kaputt"/><Exec Command="x' }], PackageReference: [], ProjectReference: [], Reference: [] },
+        }),
+      },
+    }),
+  })
+
+  await kontext($, 'D:\\Lose\\A.cs')
+  expect(lose[0]).toContain('<AllowUnsafeBlocks>true</AllowUnsafeBlocks>')
+  expect(lose[0]).not.toContain('<ImplicitUsings>')
+  expect(lose[0]).toContain('<OutputType>Exe</OutputType>')
+
+  mitProjekt = true
+  await kontext($, 'D:\\Proj\\B.cs')
+  const p = lose[lose.length - 1] ?? ''
+  expect(p).toContain('<Using Include="System" />')
+  expect(p).toContain('<Using Include="System.Math" Static="true" />')
+  expect(p).not.toContain('Exec')
+  expect(p).not.toContain('<ImplicitUsings>')
+  // Ein Bibliotheksprojekt: das Übergangsprojekt bleibt ein Programm (Library gäbe CS8805 für ein Hauptprogramm ohne Methoden).
+  expect(p).toContain('<OutputType>Exe</OutputType>')
+})
+
+test('C# allein: bei einem Projekt mit Paketen ist CS1061 gelb, ohne Pakete rot (Gegenprobe)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let pakete = true
+  loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => nurFehler("D:\\Proj\\B.cs(4,9): error CS1061: 'Fenster' does not contain a definition for 'Zeige' [x]\r\n"), {
+    einstellungen: () => ({
+      value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: 'net10.0' }, Items: { Using: [], PackageReference: pakete ? [{ Identity: 'Newtonsoft.Json' }] : [{ Identity: 'Microsoft.NET.ILLink.Tasks', IsImplicitlyDefined: 'true' }], ProjectReference: [], Reference: [] } }) },
+    }),
+  })
+
+  const gelb = await kontext($, 'D:\\Proj\\B.cs')
+  expect(gelb).not.toContain('✖')
+  expect(gelb).toContain('Fenster')
+
+  pakete = false
+  const rot = await kontext($, 'D:\\Proj\\B.cs', 'y')
+  expect(rot).toContain('✖ «B.cs»')
+})
+
+test('C# allein: Mehrfachziel-Projekt - Einstellungen werden für die erste Zielplattform gelesen und so übersetzt', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { lose, einstellungsAufrufe } = loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => ({ value: done }), {
+    einstellungen: a => ({
+      value: {
+        ...done,
+        stdout: JSON.stringify(
+          a.includes('-p:TargetFramework=net8.0')
+            ? { Properties: { TargetFramework: 'net8.0', LangVersion: '12.0' }, Items: { Using: [] } }
+            : { Properties: { TargetFrameworks: 'net8.0;net10.0' }, Items: { Using: [] } },
+        ),
+      },
+    }),
+  })
+
+  await kontext($, 'D:\\Proj\\B.cs')
+  expect(einstellungsAufrufe.length).toBe(2)
+  expect(lose[0]).toContain('<TargetFramework>net8.0</TargetFramework>')
+  expect(lose[0]).toContain('<LangVersion>12.0</LangVersion>')
+})
+
+test('C# allein: Einstellungen oder Zielplattform des Projekts nicht lesbar -> NICHT GEPRÜFT, kein Raten mit Standardwerten', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let fall: 'fehler' | 'leer' = 'fehler'
+  const { lose } = loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => ({ value: done }), {
+    einstellungen: () => (fall === 'fehler' ? { value: { ...done, exitCode: 1 } } : { value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: '', TargetFrameworks: '' }, Items: {} }) } }),
+  })
+
+  const a = await kontext($, 'D:\\Proj\\B.cs')
+  expect(a).toContain('NICHT GEPRÜFT')
+  expect(a).toContain('Einstellungen von «Mod.csproj» nicht lesbar')
+  fall = 'leer'
+  const b = await kontext($, 'D:\\Proj\\B.cs', 'y')
+  expect(b).toContain('Zielplattform von «Mod.csproj» nicht lesbar')
+  expect(lose.length).toBe(0)
+})
+
+test('C# allein: CS0017 (mehrere Main) ist ohne Projekt kein Fehler, bei einem Projekt, das ein Programm ist, schon', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, dir => (/^D:\\Proj$/i.test(dir) ? [{ name: 'Mod.csproj', kind: 'file' as const }] : []), projekt =>
+    nurFehler(projekt.includes('A.cs') ? 'D:\\X\\A.cs(7,24): error CS0017: Program has more than one entry point defined. [x]\r\n' : 'D:\\Proj\\B.cs(7,24): error CS0017: Program has more than one entry point defined. [x]\r\n'), {
+    einstellungen: () => ({ value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: 'net10.0', OutputType: 'Exe' }, Items: { Using: [] } }) } }),
+  })
+
+  expect(await kontext($, 'D:\\X\\A.cs')).not.toContain('✖')
+  expect(await kontext($, 'D:\\Proj\\B.cs')).toContain('✖ «B.cs»')
+})
+
+test('C# allein: hängt der Lauf an CA5390/CA5403, läuft er ohne die zwei neu und sagt das offen', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  let jetzt = 1_000_000
+  on('clock.now', () => ({ value: jetzt }))
+  let nr = 0
+  const { geschrieben } = loseBau(on, () => [], () => {
+    nr++
+    if (nr === 1) {
+      jetzt += 200_000
+      return { deny: 'abgebrochen' }
+    }
+    return { value: done }
+  })
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  expect(nr).toBe(2)
+  expect(text).toContain('✔ «A.cs»')
+  expect(text).toContain('CA5390 und CA5403 (eingebaute Schlüssel und Zertifikate) nicht geprüft')
+  expect(Object.values(geschrieben).some(v => v.includes('dotnet_diagnostic.CA5390.severity = none'))).toBe(true)
+})
+
+test('C# allein: CA2241 (falsche Platzhalter) ist auch im Übergangsprojekt ein Fehler; ein Vorschlag (CA1806) bleibt ein Vorschlag', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let code = 'CA2241'
+  loseBau(on, () => [], () => ({ value: { ...done, stdout: `D:\\Lose\\A.cs(5,60): warning ${code}: Provide correct arguments to formatting methods [x]\r\n` } }))
+
+  expect(await kontext($, 'D:\\Lose\\A.cs')).toContain('✖ «A.cs»')
+  code = 'CA1806'
+  const v = await kontext($, 'D:\\Lose\\A.cs', 'y')
+  expect(v).toContain('✔ «A.cs»')
+  expect(v).toContain('Verbesserungsvorschl')
+})
+
+test('C# allein: liegt über dem Temp-Ordner eine fremde Bau-Datei, wird nichts übersetzt und nichts als ✔ gemeldet', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('fs.exists', (_$, e) => ({ value: /^C:\\Directory\.Build\.targets$/i.test(String(e.path)) }))
+  const { lose, versionOrdner } = loseBau(on, () => [], () => ({ value: done }))
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  expect(lose.length).toBe(0)
+  // Schon "dotnet --version" läuft nicht (eine fremde global.json könnte ein anderes SDK wählen), und der Grund wird genannt.
+  expect(versionOrdner.length).toBe(0)
+  expect(text).not.toContain('✔')
+  expect(text).toContain('Directory.Build.targets')
+  expect(text).toContain('mitlesen')
+})
+
+test('C# allein mit Projekt: liegt über dem Temp-Ordner eine fremde Bau-Datei, baut das Übergangsprojekt nicht', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('fs.exists', (_$, e) => ({ value: /^C:\\Directory\.Build\.targets$/i.test(String(e.path)) }))
+  const { lose } = loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => ({ value: done }))
+
+  const text = await kontext($, 'D:\\Proj\\B.cs')
+  expect(lose.length).toBe(0)
+  expect(text).not.toContain('✔')
+  expect(text).toContain('mitlesen')
+})
+
+test('C# allein: dotnet --version läuft im Temp-Ordner', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { versionOrdner } = loseBau(on, () => [], () => ({ value: done }))
+
+  await kontext($, 'D:\\Lose\\A.cs')
+  expect(versionOrdner.length).toBeGreaterThan(0)
+  for (const d of versionOrdner) expect(d).toBe('C:\\Temp')
+})
+
+test('C# allein: hat das Projekt Fehler in anderen Dateien, wird eine ausgeschlossene Datei trotzdem selbst geprüft', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { lose } = loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => nurFehler("D:\\Proj\\B.cs(3,5): error CS0117: 'RSA' does not contain a definition for 'Erzeuge' [x]\r\n"), {
+    projektBau: () => nurFehler('D:\\Proj\\Andere.cs(3,1): error CS1002: ; expected [x]\r\n'),
+  })
+
+  const text = await kontext($, 'D:\\Proj\\B.cs')
+  expect(lose.length).toBeGreaterThan(0)
+  expect(text).toContain('✖ «B.cs»')
+  expect(text).not.toContain('TEILWEISE')
+})
+
+test('C# allein: ein Fehler ohne Zeile im gemeinsamen Lauf (CS2001) macht ihn nicht zum Beleg; es gilt der Lauf allein', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, ORDNER_AB, projekt =>
+    projekt.includes('B.cs')
+      ? nurFehler("CSC : error CS2001: Source file 'D:\\Lose\\B.cs' could not be found. [x]\r\n")
+      : nurFehler("D:\\Lose\\A.cs(2,1): error CS0246: The type or namespace name 'Helfer' could not be found [x]\r\n"),
+  )
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  expect(text).not.toContain('weiteren C#-Dateien')
+  expect(text).toContain('Helfer')
+})
+
+// Dritte Gegenprüfung: bestätigte Befunde und Testlücken.
+const SCAN_UMGEBUNG = (on: On) => {
+  mock.clock(on)
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\Probe' : e.name === 'TEMP' ? 'C:\\Temp' : undefined }))
+  on('fs.stat', (_$, e) => ({ value: { kind: /\.\w+$/.test(e.path) ? ('file' as const) : ('dir' as const), size: 1, mtimeMs: 0, isLink: false } }))
+}
+const scanFertig = async ($: any, name: string): Promise<string> => {
+  let ergebnis = ''
+  for (let k = 0; k < 10 && !ergebnis; k++) ergebnis = await scanResult($, `Scan ${name}`)
+  return ergebnis
+}
+const bericht = (geschrieben: Record<string, string>): string => Object.entries(geschrieben).find(([k]) => k.endsWith('fehlerbericht.txt'))?.[1] ?? ''
+const fehltName = (datei: string, name: string, code = 'CS0246') => nurFehler(`${datei}(2,1): error ${code}: The type or namespace name '${name}' could not be found [x]\r\n`)
+
+test('C# allein ohne Projekt: CS1061 (Mitglied, kann aus einer Erweiterung kommen) ist gelb mit dem Namen, nicht rot', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, ORDNER_AB, () => nurFehler("D:\\Lose\\A.cs(4,9): error CS1061: 'string' does not contain a definition for 'Kuerze' [x]\r\n"))
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  expect(text).not.toContain('✖')
+  expect(text).toContain('string')
+})
+
+test('C# allein ohne Projekt: zuerst ohne implizite usings; ist das sauber, kein zweiter Lauf (gemessen: implizite usings machen Timer mehrdeutig)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { lose } = loseBau(on, () => [], projekt =>
+    projekt.includes('<ImplicitUsings>') ? nurFehler("D:\\Lose\\Uhr.cs(2,44): error CS0104: 'Timer' is an ambiguous reference between 'System.Timers.Timer' and 'System.Threading.Timer' [x]\r\n") : { value: done },
+  )
+
+  const text = await kontext($, 'D:\\Lose\\Uhr.cs')
+  expect(text).toContain('✔ «Uhr.cs»')
+  expect(lose.length).toBe(1)
+})
+
+test('C# allein ohne Projekt: fehlen ohne implizite usings Namen und sind sie mit ihnen da, gilt der zweite Lauf', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, () => [], projekt => (projekt.includes('<ImplicitUsings>enable</ImplicitUsings>') ? { value: done } : fehltName('D:\\Lose\\A.cs', 'List<>')))
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  expect(text).toContain('✔ «A.cs»')
+  expect(text).toContain('impliziten usings')
+})
+
+test('C# allein: ein Bibliotheksprojekt schliesst ein Skript mit Hauptprogramm ohne Methoden aus - kein CS8805, das Übergangsprojekt ist ein Programm', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(
+    on,
+    () => [{ name: 'Mod.csproj', kind: 'file' as const }],
+    projekt => (projekt.includes('<OutputType>Library</OutputType>') ? nurFehler('D:\\Proj\\B.cs(1,1): error CS8805: Program using top-level statements must be an executable. [x]\r\n') : { value: done }),
+    { einstellungen: () => ({ value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: 'net10.0', OutputType: 'Library' }, Items: { Using: [] } }) } }) },
+  )
+
+  expect(await kontext($, 'D:\\Proj\\B.cs')).toContain('✔ «B.cs»')
+})
+
+test('C# allein: legt ein Programm-Projekt sein Hauptprogramm fest (StartupObject), ist CS0017 kein Fehler; ohne StartupObject schon', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let startup = 'App.Program'
+  loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => nurFehler('D:\\Proj\\B.cs(7,24): error CS0017: Program has more than one entry point defined. [x]\r\n'), {
+    einstellungen: () => ({ value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: 'net10.0', OutputType: 'Exe', StartupObject: startup }, Items: { Using: [] } }) } }),
+  })
+
+  expect(await kontext($, 'D:\\Proj\\B.cs')).not.toContain('✖')
+  startup = ''
+  expect(await kontext($, 'D:\\Proj\\B.cs', 'y')).toContain('✖ «B.cs»')
+})
+
+test('C# allein: eine Warnung (CA2241) in einer anderen Projektdatei macht den gemeinsamen Lauf nicht unbrauchbar', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], projekt =>
+    projekt.includes('andere.cs')
+      ? { value: { ...done, stdout: 'D:\\Proj\\Andere.cs(5,60): warning CA2241: Provide correct arguments to formatting methods [x]\r\n' } }
+      : nurFehler("D:\\Proj\\B.cs(4,9): error CS1061: 'string' does not contain a definition for 'Kuerze' [x]\r\n"),
+  )
+
+  const text = await kontext($, 'D:\\Proj\\B.cs')
+  expect(text).toContain('✔ «B.cs»')
+  // Der gemeinsame Lauf zählt als Beleg (nicht der Ausweg "Mitglieder unbekannt" für einen blockierten Lauf).
+  expect(text).toContain('mit den 1 Dateien von «Mod.csproj»')
+  expect(text).not.toContain('Mitglieder unbekannt')
+})
+
+test('C# allein: hat eine andere Projektdatei einen echten Fehler und fehlt allein nur ein Mitglied (CS1061), gelb statt rot; ein anderer Fehler bleibt rot', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let code = 'CS1061'
+  loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], projekt =>
+    projekt.includes('andere.cs') ? nurFehler('D:\\Proj\\Andere.cs(3,1): error CS1002: ; expected [x]\r\n') : nurFehler(`D:\\Proj\\B.cs(4,9): error ${code}: 'string' does not contain a definition for 'Kuerze' [x]\r\n`),
+  )
+
+  const gelb = await kontext($, 'D:\\Proj\\B.cs')
+  expect(gelb).not.toContain('✖')
+  expect(gelb).toContain('Mitglieder unbekannt')
+  code = 'CS0117'
+  expect(await kontext($, 'D:\\Proj\\B.cs', 'y')).toContain('✖ «B.cs»')
+})
+
+test('C# allein: Projekt mit ProjectReference oder Reference zählt wie eines mit Paketen (CS1061 gelb)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let items: Record<string, unknown> = { ProjectReference: [{ Identity: '..\\Werkzeuge\\Werkzeuge.csproj' }] }
+  loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => nurFehler("D:\\Proj\\B.cs(4,9): error CS1061: 'Fenster' does not contain a definition for 'Zeige' [x]\r\n"), {
+    einstellungen: () => ({ value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: 'net10.0' }, Items: { Using: [], ...items } }) } }),
+  })
+
+  expect(await kontext($, 'D:\\Proj\\B.cs')).not.toContain('✖')
+  items = { Reference: [{ Identity: 'Assembly-CSharp' }] }
+  expect(await kontext($, 'D:\\Proj\\B.cs', 'y')).not.toContain('✖')
+})
+
+test('C# allein: ein Using-Eintrag des Projekts für ein fehlendes Paket (Fehler in lose.GlobalUsings.g.cs, gemessen) ist ein fehlender Name, nicht "andere Datei"', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, () => [{ name: 'Mod.csproj', kind: 'file' as const }], () => nurFehler("C:\\Temp\\code-waechter\\lose_x\\obj\\lose.GlobalUsings.g.cs(2,14): error CS0246: The type or namespace name 'Xunit' could not be found [x]\r\n"), {
+    einstellungen: () => ({ value: { ...done, stdout: JSON.stringify({ Properties: { TargetFramework: 'net10.0' }, Items: { Using: [{ Identity: 'Xunit' }] } }) } }),
+  })
+
+  const text = await kontext($, 'D:\\Proj\\B.cs')
+  expect(text).not.toContain('✖')
+  expect(text).not.toContain('andere Datei')
+  expect(text).toContain('Xunit')
+})
+
+test('C# allein: in einem nicht freigegebenen Ordner wird nichts übersetzt (.NET öffnet sonst z. B. einen Schlüssel-Pfad aus dem Code)', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { lose } = loseBau(on, () => [], () => ({ value: done }))
+
+  const text = await kontext($, 'C:\\Fremd\\A.cs')
+  expect(lose.length).toBe(0)
+  expect(text).not.toContain('✔')
+})
+
+test('C# allein: Verknüpfungen im Ordner kommen nicht in den gemeinsamen Lauf', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  const { lose } = loseBau(
+    on,
+    dir => (/^D:\\Lose$/i.test(dir) ? [{ name: 'A.cs', kind: 'file' as const }, { name: 'B.cs', kind: 'file' as const, isLink: true }] : []),
+    () => fehltName('D:\\Lose\\A.cs', 'Helfer'),
+  )
+
+  await kontext($, 'D:\\Lose\\A.cs')
+  expect(lose.some(p => p.includes('B.cs'))).toBe(false)
+})
+
+test('C# allein ohne Projekt: meldet nur der Ordnerlauf einen Fehler, nennt der Hinweis auch die nicht übersetzten Methodenrümpfe; mit CS5001 nicht', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  let mitMain = false
+  loseBau(on, ORDNER_AB, projekt =>
+    projekt.includes('B.cs')
+      ? nurFehler(`D:\\Lose\\A.cs(1,11): error CS0535: 'A' does not implement interface member 'IB.M()' [x]\r\n${mitMain ? ohneMain : ''}`)
+      : fehltName('D:\\Lose\\A.cs', 'IB'),
+  )
+
+  const ohne = await kontext($, 'D:\\Lose\\A.cs')
+  expect(ohne).not.toContain('✖')
+  expect(ohne).toContain('allein nicht prüfbar')
+  expect(ohne).toContain('Methodenrümpfe der Datei sind dann nicht geprüft')
+  mitMain = true
+  const mit = await kontext($, 'D:\\Lose\\A.cs', 'y')
+  expect(mit).toContain('allein nicht prüfbar')
+  expect(mit).not.toContain('Methodenrümpfe')
+})
+
+test('C# allein: kam der gemeinsame Lauf bis zu den Methodenrümpfen (CS5001), steht kein Satz über sie im Hinweis', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  loseBau(on, ORDNER_AB, projekt => nurFehler(`D:\\Lose\\A.cs(2,1): error CS0246: The type or namespace name 'Helfer' could not be found [x]\r\n${projekt.includes('B.cs') ? ohneMain : ''}`))
+
+  const text = await kontext($, 'D:\\Lose\\A.cs')
+  expect(text).toContain('auch mit den übrigen C#-Dateien des Ordners unbekannt')
+  expect(text).not.toContain('Methodenrümpfe')
+})
+
+test('/scan ohne Projekt: Fehler im Ordnerlauf und allein -> rot im Bericht; nur im Ordnerlauf -> "allein nicht prüfbar", kein Fehler', VERTRAUT, async ($, on) => {
+  SCAN_UMGEBUNG(on)
+  let nurZusammen = false
+  const { geschrieben } = loseBau(on, ORDNER_AB, projekt => {
+    const zusammen = projekt.includes('A.cs') && projekt.includes('B.cs')
+    if (zusammen) return nurFehler("D:\\Lose\\A.cs(7,5): error CS0117: 'Config' does not contain a definition for 'Load' [x]\r\n")
+    if (projekt.includes('A.cs')) return nurZusammen ? nurFehler("D:\\Lose\\A.cs(7,5): error CS0103: The name 'Config' does not exist in the current context [x]\r\n") : nurFehler("D:\\Lose\\A.cs(7,5): error CS0117: 'Config' does not contain a definition for 'Load' [x]\r\n")
+    return { value: done }
+  })
+
+  await $.command.run({ command: 'scan', args: 'D:\\Lose' } as never)
+  const rot = await scanFertig($, 'Lose')
+  expect(rot).toContain('1 Fehler')
+  expect(bericht(geschrieben)).toContain('CS0117')
+
+  nurZusammen = true
+  for (const k of Object.keys(geschrieben)) delete geschrieben[k]
+  await $.command.run({ command: 'scan', args: 'D:\\Lose' } as never)
+  const gelb = await scanFertig($, 'Lose')
+  expect(gelb).toContain('keine Fehler')
+  expect(gelb).toContain('eingeschränkt')
+})
+
+test('/scan mit Projekt: eine vom Projekt ausgeschlossene Datei wird mit den Projektdateien allein übersetzt, ihr Fehler steht im Bericht', VERTRAUT, async ($, on) => {
+  SCAN_UMGEBUNG(on)
+  const { geschrieben, lose } = loseBau(
+    on,
+    dir => (/^D:\\Proj$/i.test(dir) ? ['Mod.csproj', 'Andere.cs', 'B.cs'].map(name => ({ name, kind: 'file' as const })) : []),
+    () => nurFehler("D:\\Proj\\B.cs(4,9): error CS1061: 'string' does not contain a definition for 'Lenght' [x]\r\n"),
+  )
+
+  await $.command.run({ command: 'scan', args: 'D:\\Proj' } as never)
+  const ergebnis = await scanFertig($, 'Proj')
+  expect(ergebnis).toContain('1 Fehler')
+  expect(bericht(geschrieben)).toContain('CS1061')
+  expect(lose.some(p => p.includes('andere.cs'))).toBe(true)
+})
+
+// ====================================================================================== Bedrohungen und Härtungsprotokoll
+// 21.11.2026: Bedrohungen schon beim Schreiben abfangen und in EINE Protokolldatei schreiben, mit Überschrift je
+// Programm, Projekt oder Mod, damit der Chat, der daran arbeitet, weiss, was zu ändern oder zu härten ist.
+// extra.da: welche Dateien es gibt (fs.stat); extra.lesen: was eine Datei vor dem ersten Schreiben enthält ('gesperrt' = nicht lesbar).
+// extra.da gibt für die übrigen Pfade undefined: dann antwortet die Prüfumgebung wie ohne diese Angabe.
+function protokollProjekt(on: On, inhalt: () => string, extra: { da?: (p: string) => boolean | undefined; lesen?: (p: string) => string | undefined } = {}) {
+  on('tool.call', () => toolAnswer as never)
+  const da = extra.da
+  if (da) {
+    on('fs.stat', (_$, e, next) => {
+      const ja = da(String(e.path))
+      if (ja === undefined) return next(e)
+      return ja ? { value: { kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false } } : ({ deny: 'nicht da' } as never)
+    })
+  }
+  on('env.get', (_$, e) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\Probe' : e.name === 'TEMP' ? 'C:\\Temp' : undefined }))
+  on('fs.list', () => ({ value: projectList }))
+  const geschrieben: Record<string, string> = {}
+  on('fs.write', (_$, e) => {
+    geschrieben[eben(e.path)] = String(e.text)
+    return { value: undefined }
+  })
+  on('fs.read', (_$, e) => {
+    const k = eben(String(e.path))
+    if (geschrieben[k] !== undefined) return { value: geschrieben[k] }
+    const vorher = extra.lesen?.(String(e.path))
+    if (vorher === 'gesperrt') return { deny: 'gesperrt' } as never
+    if (vorher !== undefined) return { value: vorher }
+    return /\.cs$/i.test(String(e.path)) ? { value: inhalt() } : ({ deny: 'nicht da' } as never)
+  })
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: 'C:\\Temp\r\n' } }
+    if (a.includes('msbuild')) return { value: { ...done, stdout: JSON.stringify({ Items: { Compile: [{ FullPath: 'D:\\Proj\\A.cs' }] } }) } }
+    return { value: done }
+  })
+  const protokoll = (): string => Object.entries(geschrieben).find(([k]) => k.endsWith('haertungsprotokoll.txt'))?.[1] ?? ''
+  return { geschrieben, protokoll }
+}
+
+const FESTES_SALZ = 'class S {\n  private static readonly byte[] Salt = "App 1"u8.ToArray();\n  byte[] K(string p) => Rfc2898DeriveBytes.Pbkdf2(p, Salt, 600000, HashAlgorithmName.SHA256, 32);\n}\n'
+const ZUFALLS_SALZ = 'class S {\n  byte[] K(string p, byte[] salt) => Rfc2898DeriveBytes.Pbkdf2(p, salt, 600000, HashAlgorithmName.SHA256, 32);\n}\n'
+
+test('Bedrohung beim Schreiben: festes Salz macht die Datei rot und steht im Härtungsprotokoll unter dem Projekt; behoben verschwindet der Eintrag', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  let inhalt = FESTES_SALZ
+  const { protokoll } = protokollProjekt(on, () => inhalt)
+
+  const rot = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: inhalt })).context ?? []).join('\n')
+  expect(rot).toContain('✖ «A.cs»')
+  expect(rot).toContain('festen Salz')
+  const p = protokoll()
+  expect(p).toContain('=== «Mod» hat 1 Fund(e) verursacht, davon 1 Fehler ===')
+  expect(p).toContain('D:\\Proj\\A.cs')
+  expect(p).toContain('Zeile 3 [FEHLER] Sicherheit (R2)')
+
+  inhalt = ZUFALLS_SALZ
+  const gut = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: inhalt })).context ?? []).join('\n')
+  expect(gut).toContain('✔ «A.cs»')
+  expect(protokoll()).toContain('Keine offenen Funde.')
+  expect(protokoll()).not.toContain('R2')
+})
+
+test('Härtungsprotokoll: ein Hinweis (gelb) steht mit HINWEIS drin, die Datei bleibt ✔', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  const inhalt = 'class C {\n  bool IstStopp(string t)\n  {\n    var w = t.Split(\' \');\n    return w[0] == "!stopp";\n  }\n}\n'
+  const { protokoll } = protokollProjekt(on, () => inhalt)
+
+  const text = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: inhalt })).context ?? []).join('\n')
+  expect(text).toContain('✔ «A.cs»')
+  expect(protokoll()).toContain('=== «Mod» hat 1 Fund(e) verursacht ===')
+  expect(protokoll()).toContain('Zeile 4 [HINWEIS] Härtung (R9)')
+})
+
+const ALTER_STAND = JSON.stringify({
+  x: 1,
+  'd:\\proj\\b.cs': { file: 'D:\\Proj\\B.cs', programm: 'Mod', eintraege: [{ line: 7, regel: 'R9', schwer: false, text: 'alter Fund in B' }] },
+  // Datei da, aber Eintrag ohne Liste: darf das Protokoll nicht zum Stehen bringen.
+  'd:\\proj\\c.cs': { file: 'D:\\Proj\\C.cs', programm: 'Mod' },
+})
+const STAND_JSON = /Haertungsprotokoll\.json$/i
+
+test('Härtungsprotokoll: fremde Einträge in der Stand-Datei werden verworfen, Einträge gelöschter Dateien fallen weg, vorhandene bleiben', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  let bGibtEs = true
+  const { protokoll } = protokollProjekt(on, () => FESTES_SALZ, { da: p => (/\\B\.cs$/i.test(p) ? bGibtEs : /\\C\.cs$/i.test(p) ? true : undefined), lesen: p => (STAND_JSON.test(p) ? ALTER_STAND : undefined) })
+  await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: FESTES_SALZ })
+  expect(protokoll()).toContain('=== «Mod» hat 2 Fund(e) verursacht, davon 1 Fehler ===')
+  expect(protokoll()).toContain('D:\\Proj\\B.cs» Zeile 7 [HINWEIS] alter Fund in B')
+  bGibtEs = false
+  await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: FESTES_SALZ })
+  expect(protokoll()).toContain('=== «Mod» hat 1 Fund(e) verursacht, davon 1 Fehler ===')
+  expect(protokoll()).not.toContain('B.cs')
+})
+
+test('Härtungsprotokoll: kaputte Stand-Datei wird als .kaputt.json aufbewahrt; nicht lesbare wird nie überschrieben', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  const { geschrieben, protokoll } = protokollProjekt(on, () => FESTES_SALZ, { da: p => (STAND_JSON.test(p) ? true : undefined), lesen: p => (STAND_JSON.test(p) ? '{kaputt' : undefined) })
+  await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: FESTES_SALZ })
+  expect(Object.entries(geschrieben).find(([k]) => k.endsWith('haertungsprotokoll.kaputt.json'))?.[1]).toBe('{kaputt')
+  expect(protokoll()).toContain('Zeile 3 [FEHLER] Sicherheit (R2)')
+})
+
+test('Härtungsprotokoll: ist die Stand-Datei da, aber gesperrt, wird weder .json noch .txt geschrieben', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  const { geschrieben } = protokollProjekt(on, () => FESTES_SALZ, { da: p => (STAND_JSON.test(p) ? true : undefined), lesen: p => (STAND_JSON.test(p) ? 'gesperrt' : undefined) })
+  const rot = ((await $.tool.call({ tool: 'Write', file_path: 'D:\\Proj\\A.cs', content: FESTES_SALZ })).context ?? []).join('\n')
+  expect(rot).toContain('festen Salz')
+  expect(Object.keys(geschrieben).filter(k => /haertungsprotokoll/i.test(k))).toEqual([])
 })
