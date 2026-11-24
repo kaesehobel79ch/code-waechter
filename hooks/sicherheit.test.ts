@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import {
   BERICHT_ZEILEN, GITLEAKS_VORHER, banditLesen, berichtBlock, berichtNeu, cppcheckLesen, devskimImWort, devskimLesen, gitleaksLesen,
-  musterBefunde, rein, scannen, scannerFuer,
+  cMuster, geheimMuster, musterBefunde, rein, scannen, scannerFuer,
 } from './sicherheit'
 import type { Lauf, Umgebung } from './sicherheit'
 
@@ -58,7 +58,8 @@ test('Bandit: hohe Schwere mit hoher Sicherheit ist ein Fehler; Passwort-Regeln 
   ]))
   expect(b.fehler).toBe(undefined)
   expect(b.uebersprungen).toBe(undefined)
-  expect(b.funde.map(f => [f.line, f.col, f.code, f.schwer, f.geheim === true])).toEqual([[4, 5, 'B602', true, false], [9, 12, 'B105', false, true]])
+  // Seit 24.11.2026 (Sicherheits-Crashtest) ist ein eingebautes Passwort (B105) ein Fehler, nicht mehr ein Hinweis.
+  expect(b.funde.map(f => [f.line, f.col, f.code, f.schwer, f.geheim === true])).toEqual([[4, 5, 'B602', true, false], [9, 12, 'B105', true, true]])
   expect(JSON.stringify(b.funde)).not.toContain('Sommer2026')
   // Gemessen 20.11.2026: ohne -x übersprang Bandit eine Datei unter .github - dann steht in "metrics" keine Datei.
   expect(banditLesen(BANDIT_JSON([], { _totals: { loc: 0 } })).uebersprungen).toBe(true)
@@ -102,10 +103,11 @@ test('Harmony und Process.Start: Regeln aus der Anleitung von Harmony 2, bewusst
 
 test('Auswahl: nur die passenden Scanner je Dateiart', () => {
   expect(scannerFuer('D:\\m\\Patch.cs')).toEqual({ devskim: true, cppcheck: false, bandit: false, gitleaks: true, muster: true })
-  expect(scannerFuer('D:\\c\\a.cpp')).toEqual({ devskim: true, cppcheck: true, bandit: false, gitleaks: true, muster: false })
-  expect(scannerFuer('D:\\c\\a.h')).toEqual({ devskim: true, cppcheck: true, bandit: false, gitleaks: true, muster: false })
-  expect(scannerFuer('D:\\p\\a.py')).toEqual({ devskim: false, cppcheck: false, bandit: true, gitleaks: true, muster: false })
-  expect(scannerFuer('D:\\p\\a.pyw')).toEqual({ devskim: false, cppcheck: false, bandit: true, gitleaks: true, muster: false })
+  // Seit 24.11.2026 laufen eigene Muster auch bei C/C++ (Überlauf, Formatstring) und Python (eingebaute Schlüssel).
+  expect(scannerFuer('D:\\c\\a.cpp')).toEqual({ devskim: true, cppcheck: true, bandit: false, gitleaks: true, muster: true })
+  expect(scannerFuer('D:\\c\\a.h')).toEqual({ devskim: true, cppcheck: true, bandit: false, gitleaks: true, muster: true })
+  expect(scannerFuer('D:\\p\\a.py')).toEqual({ devskim: false, cppcheck: false, bandit: true, gitleaks: true, muster: true })
+  expect(scannerFuer('D:\\p\\a.pyw')).toEqual({ devskim: false, cppcheck: false, bandit: true, gitleaks: true, muster: true })
   expect(scannerFuer('D:\\m\\Config\\items.xml')).toEqual({ devskim: false, cppcheck: false, bandit: false, gitleaks: true, muster: false })
 })
 
@@ -141,7 +143,8 @@ test('Scannen: fehlende Scanner stehen offen mit dem Installationsbefehl, nie al
   const { u, aufrufe } = umgebung({}, () => leer)
   const e = await scannen(u, 'D:\\c\\a.cpp', 'int main() { return 0; }')
   expect(e.funde).toEqual([])
-  expect(e.liefen).toEqual([])
+  // Seit 24.11.2026 laufen bei C/C++ die eigenen Muster (kein fremdes Programm) - nur sie, kein Scanner.
+  expect(e.liefen).toEqual(['Muster'])
   expect(e.luecken.join(' | ')).toContain('DevSkim fehlt (einmalig: dotnet tool install --global Microsoft.CST.DevSkim.CLI)')
   expect(e.luecken.join(' | ')).toContain('Cppcheck fehlt (einmalig: winget install Cppcheck.Cppcheck)')
   expect(e.luecken.join(' | ')).toContain('Gitleaks fehlt (einmalig: winget install Gitleaks.Gitleaks)')
@@ -245,4 +248,53 @@ test('Sammelbericht: neueste Prüfung oben, Kopf nur einmal (auch englisch), Tex
   let lang = a
   for (let i = 0; i < 1000; i++) lang = berichtNeu(lang, berichtBlock(`${i}`, 'D:\\m\\A.cs', e1))
   expect(lang.split('\r\n').length).toBeLessThan(BERICHT_ZEILEN + 1)
+})
+
+// Sicherheits-Crashtest 24.11.2026: eval, exec, pickle, Pufferüberlauf, Formatstring und eingebaute Schlüssel sind Fehler.
+test('Bandit: exec, eval, pickle, marshal, yaml.load und eingebaute Passwörter sind Fehler; import pickle bleibt ein Hinweis', () => {
+  const b = banditLesen(BANDIT_JSON([
+    { issue_confidence: 'HIGH', issue_severity: 'MEDIUM', issue_text: 'Use of exec detected.', line_number: 2, col_offset: 4, test_id: 'B102' },
+    { issue_confidence: 'HIGH', issue_severity: 'MEDIUM', issue_text: 'Use of possibly insecure function - consider using safer ast.literal_eval.', line_number: 3, col_offset: 4, test_id: 'B307' },
+    { issue_confidence: 'HIGH', issue_severity: 'MEDIUM', issue_text: 'Pickle and modules that wrap it can be unsafe', line_number: 4, col_offset: 4, test_id: 'B301' },
+    { issue_confidence: 'HIGH', issue_severity: 'MEDIUM', issue_text: 'Deserialization with the marshal module is possibly dangerous.', line_number: 5, col_offset: 4, test_id: 'B302' },
+    { issue_confidence: 'HIGH', issue_severity: 'MEDIUM', issue_text: 'Use of unsafe yaml load.', line_number: 6, col_offset: 4, test_id: 'B506' },
+    { issue_confidence: 'MEDIUM', issue_severity: 'LOW', issue_text: "Possible hardcoded password: 'x'", line_number: 7, col_offset: 4, test_id: 'B106' },
+    { issue_confidence: 'HIGH', issue_severity: 'LOW', issue_text: 'Consider possible security implications associated with pickle module.', line_number: 1, col_offset: 0, test_id: 'B403' },
+  ]))
+  expect(b.funde.map(f => `${f.code}${f.schwer ? '!' : ''}`)).toEqual(['B102!', 'B307!', 'B301!', 'B302!', 'B506!', 'B106!', 'B403'])
+})
+
+test('C/C++: Überlauf-Funktionen und Formatstrings ohne festen Text sind Fehler; sichere Formen, Kommentare, Texte und Methoden nicht', () => {
+  const art = (text: string) => cMuster(text).map(f => `${f.code}@${f.line}`)
+  expect(art('void f(char *d, const char *s)\n{\n  strcpy(d, s);\n  strcat(d, s);\n  gets(d);\n  sprintf(d, "%s", s);\n}\n'))
+    .toEqual(['C-UEBERLAUF@3', 'C-UEBERLAUF@4', 'C-UEBERLAUF@5', 'C-UEBERLAUF@6'])
+  expect(art('void f(const char *s, char *d, size_t n)\n{\n  printf(s);\n  fprintf(stderr, s);\n  snprintf(d, n, s);\n  syslog(LOG_ERR, s);\n}\n'))
+    .toEqual(['C-FORMAT@3', 'C-FORMAT@4', 'C-FORMAT@5', 'C-FORMAT@6'])
+  // Sichere Formen: festes Format, auch L"..." und _T("..."); Format über mehrere Zeilen.
+  expect(art('void f(const char *s, char *d, size_t n)\n{\n  printf("%s", s);\n  printf("hallo\\n");\n  fprintf(stderr, "Fehler: %s", s);\n  snprintf(d, n, "%s", s);\n  wprintf(L"%ls", w);\n  _tprintf(_T("%s"), s);\n  printf(\n    "%d",\n    n);\n  strncpy(d, s, n);\n}\n')).toEqual([])
+  // Im Kommentar, im Text, als Methode eines Objekts, als Teil eines Namens und bewusst markiert: still.
+  expect(art('// strcpy(d, s) war hier\n/* printf(s); */\nconst char *t = "strcpy(a, b)";\nobj.strcpy(a, b);\nmy_strcpy(a, b);\nstrcpy(d, s); // code-waechter:ok SICHERHEIT Länge oben geprüft\n')).toEqual([])
+})
+
+test('Eingebaute Schlüssel in C#, C und Python sind Fehler (Wert verborgen); Platzhalter, kurze Werte, Prüfprojekte und markierte Stellen nicht', () => {
+  const art = (text: string, file = 'D:\\p\\a.py') => geheimMuster(text, file).map(f => `${f.code}@${f.line}`)
+  expect(art('API_KEY = "sk-live-4f9a8b7c6d5e4f3a2b1c"\n')).toEqual(['GEHEIMNIS@1'])
+  expect(art('x = 1\nprivate const string ApiKey = "AKfy7Hq2LmZ9pRt4Wv8X";\n', 'D:\\p\\A.cs')).toEqual(['GEHEIMNIS@2'])
+  expect(art('konfig = {"client_secret": "a8F3kL0pQ7zX2mN5vB9c"}\n')).toEqual(['GEHEIMNIS@1'])
+  expect(geheimMuster('API_KEY = "sk-live-4f9a8b7c6d5e4f3a2b1c"\n', 'D:\\p\\a.py')[0].geheim).toBe(true)
+  expect(JSON.stringify(geheimMuster('API_KEY = "sk-live-4f9a8b7c6d5e4f3a2b1c"\n', 'D:\\p\\a.py'))).not.toContain('4f9a8b7c')
+  // Echte Fehlalarme der Gitleaks-Regel generic-api-key (24.11.2026): Übersetzungsschlüssel bleiben still.
+  expect(art('_localization_dazu(text, [{"Key": "khGegenprobeE18Anteil", "english": "Warns at 5 % of the run."}])\n')).toEqual([])
+  expect(art('API_KEY = "DEIN-SCHLUESSEL-HIER-1234"\napi_key = "abc123"\npassword = os.environ["PW"]\ntoken_type = "Bearer"\n')).toEqual([])
+  expect(art('API_KEY = "sk-live-4f9a8b7c6d5e4f3a2b1c"  # code-waechter:ok SICHERHEIT öffentlicher Probe-Schlüssel\n')).toEqual([])
+  expect(art('const string Kennwort = "Sommer2026Herbst!x";\n', 'D:\\p\\App.Pruefung\\Probe.cs')).toEqual([])
+  expect(art('const string Kennwort = "Sommer2026Herbst!x";\n', 'D:\\p\\App.Tests\\Probe.cs')).toEqual([])
+})
+
+test('Scannen: die eigenen Muster laufen auch bei Python (eingebauter Schlüssel) und C (Überlauf) und machen die Datei rot', async () => {
+  const { u } = umgebung({}, () => leer)
+  const py = await scannen(u, 'D:\\p\\a.py', 'API_KEY = "sk-live-4f9a8b7c6d5e4f3a2b1c"\n')
+  expect(py.funde.map(f => `${f.code}${f.schwer ? '!' : ''}`)).toEqual(['GEHEIMNIS!'])
+  const c = await scannen(u, 'D:\\c\\a.c', 'void f(char *d, const char *s) { strcpy(d, s); }\n')
+  expect(c.funde.map(f => `${f.code}${f.schwer ? '!' : ''}`)).toEqual(['C-UEBERLAUF!'])
 })

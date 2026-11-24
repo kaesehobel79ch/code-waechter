@@ -53,7 +53,7 @@ const CS = /\.cs$/i
 const PY = /\.pyw?$/i
 
 export function scannerFuer(file: string): { devskim: boolean; cppcheck: boolean; bandit: boolean; gitleaks: boolean; muster: boolean } {
-  return { devskim: CS.test(file) || C_CPP.test(file), cppcheck: C_CPP.test(file), bandit: PY.test(file), gitleaks: true, muster: CS.test(file) }
+  return { devskim: CS.test(file) || C_CPP.test(file), cppcheck: C_CPP.test(file), bandit: PY.test(file), gitleaks: true, muster: CS.test(file) || C_CPP.test(file) || PY.test(file) }
 }
 
 // Text aus einem Scanner für Meldung und Bericht: ohne Farbcodes und Steuerzeichen (sonst entstünden falsche Berichtszeilen), gekürzt.
@@ -132,6 +132,11 @@ export const BANDIT_AUSGELASSEN = 'B101,B311,B404,B603,B607'
 export const BANDIT_KEIN_AUSSCHLUSS = '*.code-waechter-nie'
 // Diese Regeln geben das gefundene Passwort im Text wieder: der Text wird ersetzt.
 const BANDIT_PASSWORT = new Set(['B105', 'B106', 'B107'])
+// Harte Blocker unabhängig von Bandits eigener Schwere (24.11.2026, nach einem Sicherheits-Crashtest): exec, eval, pickle, marshal und
+// yaml.load führen fremden Code aus; eingebaute Passwörter. Gemessen am 24.11.2026 an 325 Python-Dateien eines Entwicklers: B105-B107 und
+// pickle/marshal/yaml 0 Treffer, eval 2 und exec 5 - alle bewusst (eingeschränktes eval, exec eigener Blender-Dateien), diese tragen
+// "# nosec B307" bzw. "# nosec B102" mit Grund.
+export const BANDIT_SCHWER = new Set(['B102', 'B105', 'B106', 'B107', 'B301', 'B302', 'B307', 'B506'])
 
 // ---- Bandit: -f json; Felder laut Anleitung (results[].line_number, issue_severity, issue_confidence, test_id, issue_text).
 // uebersprungen: in "metrics" steht keine Datei - Bandit hat sie nicht gelesen.
@@ -153,7 +158,7 @@ export function banditLesen(stdout: string): { funde: SFund[]; fehler?: string; 
       col: Number(r.col_offset) >= 0 ? Number(r.col_offset) + 1 : 0,
       code,
       text: `[${r.issue_severity}/${r.issue_confidence}] ${passwort ? t('möglicherweise eingebautes Passwort (Text verborgen)', 'possible hardcoded password (text hidden)') : rein(String(r.issue_text ?? ''))}`,
-      schwer: r.issue_severity === 'HIGH' && r.issue_confidence === 'HIGH',
+      schwer: (r.issue_severity === 'HIGH' && r.issue_confidence === 'HIGH') || BANDIT_SCHWER.has(code),
       scanner: 'Bandit',
       ...(passwort ? { geheim: true } : {}),
     }
@@ -249,6 +254,125 @@ export function musterBefunde(text: string): SFund[] {
   return funde
 }
 
+// ---- C/C++: Pufferüberlauf-Funktionen und Formatstrings, die kein fester Text sind (24.11.2026, nach einem Sicherheits-Crashtest).
+// Gemessen am 24.11.2026 (DevSkim 1.0.90, Cppcheck 2.22.0): Cppcheck meldet strcpy/sprintf/printf(s) gar nicht; DevSkim meldet strcpy und
+// strcat als "Important", aber JEDES printf und fprintf (auch printf("%s", s)) unter derselben Regel DS154189 "Moderate" - eine
+// Hochstufung dieser Regel machte jedes printf rot. Darum eigene, genaue Muster. Bewusste Stellen: "code-waechter:ok SICHERHEIT" in der Zeile.
+const C_UEBERLAUF = /\b(gets|strcpy|strcat|sprintf|vsprintf|wcscpy|wcscat|_mbscpy|_mbscat|_tcscpy|_tcscat|lstrcpy[AW]?|lstrcat[AW]?|StrCpy[AW]?|StrCat[AW]?)\s*\(/g
+// Funktion -> Stelle des Formatarguments (0-basiert).
+const C_FORMAT: Record<string, number> = { printf: 0, vprintf: 0, wprintf: 0, vwprintf: 0, fprintf: 1, vfprintf: 1, fwprintf: 1, vfwprintf: 1, dprintf: 1, syslog: 1, snprintf: 2, vsnprintf: 2, _snprintf: 2, swprintf: 2 }
+const C_FORMAT_RE = new RegExp(`\\b(${Object.keys(C_FORMAT).join('|')})\\s*\\(`, 'g')
+
+// Kommentare und den Inhalt von Zeichenketten und Zeichen durch Leerzeichen ersetzen (Anführungszeichen bleiben, Zeilen und Längen
+// auch): so zählt "strcpy(" in einem Text oder Kommentar nicht, und ein festes Formatargument beginnt weiterhin mit ".
+function cBereinigt(text: string): string {
+  const o = text.split('')
+  let i = 0
+  const leer = (a: number, b: number) => {
+    for (let k = a; k < b && k < o.length; k++) if (o[k] !== '\n' && o[k] !== '\r') o[k] = ' '
+  }
+  while (i < text.length) {
+    const c = text[i]
+    const d = text[i + 1]
+    if (c === '/' && d === '/') {
+      const e = text.indexOf('\n', i)
+      const s = e === -1 ? text.length : e
+      leer(i, s)
+      i = s
+    } else if (c === '/' && d === '*') {
+      const e = text.indexOf('*/', i + 2)
+      const s = e === -1 ? text.length : e + 2
+      leer(i, s)
+      i = s
+    } else if (c === '"' || c === "'") {
+      let k = i + 1
+      while (k < text.length && text[k] !== c && text[k] !== '\n') k += text[k] === '\\' ? 2 : 1
+      leer(i + 1, k)
+      i = k + 1
+    } else i++
+  }
+  return o.join('')
+}
+
+function cArgumente(code: string, offen: number): string[] {
+  const teile: string[] = []
+  let tiefe = 0
+  let start = offen + 1
+  for (let k = offen; k < code.length; k++) {
+    const c = code[k]
+    if (c === '(' || c === '[' || c === '{') tiefe++
+    else if (c === ')' || c === ']' || c === '}') {
+      tiefe--
+      if (tiefe === 0) {
+        teile.push(code.slice(start, k))
+        return teile
+      }
+    } else if (c === ',' && tiefe === 1) {
+      teile.push(code.slice(start, k))
+      start = k + 1
+    } else if (c === ';' && tiefe <= 1) break
+  }
+  return []
+}
+
+const zeileVon = (text: string, at: number): number => text.slice(0, at).split('\n').length
+
+export function cMuster(text: string): SFund[] {
+  const code = cBereinigt(text)
+  const roh = text.split(/\r?\n/)
+  const markiert = (nr: number) => OK_SICHER.test(roh[nr - 1] ?? '')
+  const funde: SFund[] = []
+  for (const m of code.matchAll(C_UEBERLAUF)) {
+    const at = m.index ?? 0
+    if (at > 0 && /[\w.>:]/.test(code[at - 1] ?? '')) continue // Methode eines Objekts oder Teil eines Namens
+    const nr = zeileVon(code, at)
+    if (markiert(nr)) continue
+    funde.push({ line: nr, col: at - code.lastIndexOf('\n', at - 1), code: 'C-UEBERLAUF', schwer: true, scanner: t('Muster', 'pattern'),
+      text: t(`${m[1]}() prüft die Grösse des Ziels nicht - ein zu langer Text überschreibt Speicher. Die Fassung mit Grösse verwenden (snprintf, strcpy_s/strncpy_s mit Ziellänge, fgets statt gets).`,
+        `${m[1]}() does not check the size of the target - a text that is too long overwrites memory. Use the sized version (snprintf, strcpy_s/strncpy_s with target length, fgets instead of gets).`) })
+  }
+  for (const m of code.matchAll(C_FORMAT_RE)) {
+    const at = m.index ?? 0
+    if (at > 0 && /[\w.>:]/.test(code[at - 1] ?? '')) continue
+    const args = cArgumente(code, at + m[0].length - 1)
+    const fmt = (args[C_FORMAT[m[1] ?? ''] ?? 0] ?? '').trim()
+    if (fmt === '' || /^(?:L|u8|u|U)?"/.test(fmt) || /^(?:_T|TEXT|__T)\s*\(\s*"/.test(fmt)) continue
+    const nr = zeileVon(code, at)
+    if (markiert(nr)) continue
+    funde.push({ line: nr, col: at - code.lastIndexOf('\n', at - 1), code: 'C-FORMAT', schwer: true, scanner: t('Muster', 'pattern'),
+      text: t(`${m[1]}() bekommt als Format keinen festen Text - enthält er %n oder %s, liest oder schreibt das Programm fremden Speicher. Festes Format verwenden, z. B. ${m[1] === 'printf' ? 'printf("%s", text)' : 'ein "%s" als Format'}.`,
+        `${m[1]}() gets no fixed text as format - if it contains %n or %s, the program reads or writes foreign memory. Use a fixed format, e.g. ${m[1] === 'printf' ? 'printf("%s", text)' : 'a "%s" format'}.`) })
+  }
+  return funde
+}
+
+// ---- Eingebaute Schlüssel in Code (C#, C/C++, Python): ein Name wie api_key, secret, token, password mit einem langen, zufällig
+// aussehenden Text. Gitleaks' Regel generic-api-key bleibt aus: gemessen am 24.11.2026 traf sie in mehreren Programmen 5-mal, alles
+// Übersetzungsschlüssel und eine Tastenabfrage (und in einem Spiel-Mod-Projekt 5247-mal). Diese Regel traf in 1492 C#-, C- und
+// Python-Dateien 5-mal, alle in Prüfprojekten (darum ausgenommen, siehe PRUEF_PFAD); ausserhalb 0-mal.
+const GEHEIM_NAME = /\b[\w.]*?(?:api[_-]?key|apikey|secret|access[_-]?key|private[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|bearer[_-]?token|client[_-]?secret|passwor[dt]|passwd|kennwort)\w*["']?\s*[:=]\s*@?\$?["']([^"'\s]{16,})["']/gi
+const PLATZHALTER = /dein|your|xxx|placeholder|example|beispiel|changeme|<|\.\.\.|\$\{|\{\{|%s|TODO/i
+// Prüf- und Testprojekte haben absichtlich feste Probe-Kennwörter (24.11.2026 gemessen: alle 5 Treffer lagen in Prüfprojekten).
+const PRUEF_PFAD = /\.test\.|[\\/](?:[^\\/]*[._-])?(?:(?:Unit|Integration)?Tests?|Probe|Pruefung)[\\/]/i
+
+export function geheimMuster(text: string, file = ''): SFund[] {
+  const funde: SFund[] = []
+  if (PRUEF_PFAD.test(file)) return funde
+  const zeilen = text.split(/\r?\n/)
+  zeilen.forEach((z, i) => {
+    if (OK_SICHER.test(z) || /gitleaks:allow/.test(z)) return
+    for (const m of z.matchAll(GEHEIM_NAME)) {
+      const wert = m[1] ?? ''
+      if (PLATZHALTER.test(wert) || !/[A-Za-z]/.test(wert) || !/\d/.test(wert) || new Set(wert).size < 10) continue
+      funde.push({ line: i + 1, col: (m.index ?? 0) + 1, code: 'GEHEIMNIS', schwer: true, scanner: t('Muster', 'pattern'), geheim: true,
+        text: t('Schlüssel oder Passwort steht im Quelltext (Wert verborgen) - aus einer geschützten Ablage oder Umgebungsvariable lesen, nie einbauen.',
+          'key or password is in the source code (value hidden) - read it from protected storage or an environment variable, never embed it.') })
+      return
+    }
+  })
+  return funde
+}
+
 // ---- Alle passenden Scanner für eine Datei. Die Scanner laufen gleichzeitig; ein Absturz eines Scanners ist eine Lücke, nie "OK",
 // und nimmt den anderen Scannern ihre Funde nicht weg.
 export async function scannen(u: Umgebung, file: string, text: string | undefined): Promise<Ergebnis> {
@@ -268,7 +392,9 @@ export async function scannen(u: Umgebung, file: string, text: string | undefine
 
   const jobs: Promise<void>[] = []
   if (wahl.muster && text !== undefined) {
-    funde.push(...musterBefunde(text))
+    if (CS.test(file)) funde.push(...musterBefunde(text))
+    if (C_CPP.test(file)) funde.push(...cMuster(text))
+    funde.push(...geheimMuster(text, file))
     liefen.push(t('Muster', 'patterns'))
   }
   if (wahl.devskim) {
