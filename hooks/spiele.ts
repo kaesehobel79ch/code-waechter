@@ -11,7 +11,8 @@ export type GameFinding = { file: string; line: number; col: number; code: strin
 // Ein Name aus dem Projekt (z. B. der Dateiname) in einem eigenen Text: in «…», ohne Steuer- und Richtungszeichen, gekürzt.
 // Die Mod zeigt eigene Texte ungekennzeichnet; so bleibt ein Dateiname, der wie eine Anweisung lautet, als Daten erkennbar.
 function quoted(s: string): string {
-  const x = s.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿«»]/g, ' ').trim()
+  // Unicode-Tags (U+E0000-U+E007F) ganz weg: unsichtbarer Text für eine KI (Gegenprüfung 28.11.2026)
+  const x = s.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff«»]/g, ' ').replace(/[\u{E0000}-\u{E007F}]/gu, '').trim()
   return `«${x.length > 120 ? `${x.slice(0, 119)}…` : x}»`
 }
 

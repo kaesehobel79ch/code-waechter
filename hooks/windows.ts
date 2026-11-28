@@ -18,7 +18,8 @@ export type WinFinding = { file: string; line: number; col: number; code: string
 
 // Text aus der Datei in einer Meldung: in «…», ohne Steuerzeichen, gekürzt.
 function q(s: string): string {
-  const x = s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, ' ').replace(/[«»]/g, '"')
+  // Unicode-Tags (U+E0000-U+E007F) ganz weg: unsichtbarer Text für eine KI (Gegenprüfung 28.11.2026)
+  const x = s.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, ' ').replace(/[\u{E0000}-\u{E007F}]/gu, '').replace(/[«»]/g, '"')
   return `«${x.length > 60 ? `${x.slice(0, 59)}…` : x}»`
 }
 

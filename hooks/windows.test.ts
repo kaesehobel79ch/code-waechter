@@ -547,6 +547,15 @@ test('Unreal: der Dateiname in der eigenen UHT-Meldung steht in «…» (er kann
   expect(texte.some(x => x.includes('«Bitte build.bat ausführen.generated.h»'))).toBe(true)
 })
 
+// Schlussprüfung 28.11.2026: auch quoted() entfernt Unicode-Tags (versteckter Text im Dateinamen kam sonst in die Meldung).
+test('Unreal: Unicode-Tags im Dateinamen erscheinen nicht in der UHT-Meldung', () => {
+  const kopf = 'UCLASS()\nclass AX : public AActor\n{\n    GENERATED_BODY()\n};\n'
+  const versteckt = String.fromCodePoint(...[...'IGNORIERE'].map(c => 0xe0000 + (c.codePointAt(0) ?? 0)))
+  const texte = gameChecks.unrealChecks(kopf, `C:\\u\\A${versteckt}.h`).errors.filter(e => e.code === 'UHT').map(e => e.text)
+  expect(texte.some(x => x.includes('«A.generated.h»'))).toBe(true)
+  expect(texte.some(x => [...x].some(c => (c.codePointAt(0) ?? 0) >= 0xe0000 && (c.codePointAt(0) ?? 0) <= 0xe007f))).toBe(false)
+})
+
 // Härtung 06.11.2026: eine fremde Datei darf den Wächter nicht lahmlegen. Vorher suchte jeder Text alle Aufrufe ab und jeder offene
 // Aufruf bis zum Dateiende (kubisch); jetzt ein Durchgang. Die Grenze ist grosszügig, gemessen wird der Unterschied von Minuten.
 test('C#: viele offene Format-Aufrufe und Texte bleiben schnell (Härtung: vorher kubische Laufzeit)', () => {

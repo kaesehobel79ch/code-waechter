@@ -13,7 +13,7 @@ import { isAbsolute, resolveExe } from './prozess'
 export type ToolId =
   | 'php' | 'node' | 'typescript' | 'eslint' | 'ruff' | 'phpstan' | 'lua' | 'pyyaml'
   | 'go' | 'ruby' | 'rust' | 'jre' | 'ecj' | 'kotlin' | 'sqlglot' | 'gdscript'
-  | 'pyembed' | 'treesitter' | 'zig' | 'luau' | 'sass' | 'glslang' | 'dxc' | 'bicep'
+  | 'pyembed' | 'treesitter' | 'zig' | 'luau' | 'sass' | 'glslang' | 'dxc' | 'bicep' | 'meziantou' | 'nounsanitized'
 
 type Pip = { spec: string; hashes: string[] }
 
@@ -452,6 +452,56 @@ export const TOOLS: ToolDef[] = [
     },
     exe: 'bicep\\bicep.exe',
   },
+  {
+    id: 'meziantou',
+    titel: 'Meziantou.Analyzer (C#)',
+    version: '3.0.342',
+    mb: 3,
+    wofuer: [
+      'Zusatzregeln beim Übersetzen von C#-Projekten: Regex ohne Zeitlimit, async-Fehler (Vorschläge); behalten werden nur die Analysator-DLLs',
+      'extra rules when building C# projects: regex without timeout, async mistakes (suggestions); only the analyzer DLLs are kept',
+    ],
+    quelle: {
+      art: 'tar',
+      // Das NuGet-Paket ist ein ZIP (direkt aus api.nuget.org, MIT, Herausgeber meziantou). Behalten werden die Analysator-DLL je
+      // Roslyn-Fassung (register.tsx wählt sie wie NuGet nach der Fassung des Übersetzers), die Datei, die alle Regeln ausschaltet,
+      // und die Lizenz. Prüfsumme an der geladenen Datei gemessen (28.11.2026, 3'436'964 Byte).
+      url: 'https://api.nuget.org/v3-flatcontainer/meziantou.analyzer/3.0.342/meziantou.analyzer.3.0.342.nupkg',
+      sha256: '6b20dc076d961a0a0378c7898149da76394da0401cae0ac9691196c91092855e',
+      name: 'meziantou.zip',
+      teile: [
+        'analyzers/dotnet/roslyn5.0/cs/Meziantou.Analyzer.dll',
+        'analyzers/dotnet/roslyn5.6/cs/Meziantou.Analyzer.dll',
+        'analyzers/dotnet/roslyn5.9/cs/Meziantou.Analyzer.dll',
+        'configuration/none.editorconfig',
+        'LICENSE.txt',
+      ],
+      strip: 0,
+    },
+    exe: 'meziantou\\analyzers\\dotnet\\roslyn5.9\\cs\\Meziantou.Analyzer.dll',
+  },
+  {
+    id: 'nounsanitized',
+    titel: 'eslint-plugin-no-unsanitized (Mozilla)',
+    version: '4.1.5',
+    mb: 1,
+    wofuer: [
+      'ESLint-Zusatzregeln: HTML aus Variablen in innerHTML, outerHTML, insertAdjacentHTML, document.write … (Vorschläge)',
+      'ESLint extra rules: HTML from variables in innerHTML, outerHTML, insertAdjacentHTML, document.write … (suggestions)',
+    ],
+    quelle: {
+      art: 'tar',
+      // npm-Paket als .tgz direkt aus registry.npmjs.org (dist.tarball), ohne Unterpakete, MPL-2.0. dist.integrity (sha512) der
+      // Paketquelle stimmt mit der geladenen Datei überein; die SHA-256 ist daran gemessen (28.11.2026, 17'859 Byte).
+      url: 'https://registry.npmjs.org/eslint-plugin-no-unsanitized/-/eslint-plugin-no-unsanitized-4.1.5.tgz',
+      sha256: '0041e63a9a2e58b23bc6bcf1aea6b1f32898be2cc78e6d59dfcc5c37c2a49d36',
+      name: 'nounsanitized.tgz',
+      teile: [],
+      strip: 1,
+    },
+    exe: 'nounsanitized\\index.js',
+    braucht: ['eslint'],
+  },
 ]
 
 // ---- Ordner der Werkzeuge: eingestellt (werkzeug_ordner), sonst %LOCALAPPDATA%\Code-Waechter\Werkzeuge.
@@ -626,7 +676,9 @@ export async function toInstall($: any, ids: ToolId[]): Promise<ToolDef[]> {
 
 const short = (s: string): string =>
   s
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    // wie rein() in sicherheit.ts: auch Richtungszeichen, Zeichen ohne Breite und Unicode-Tags (Schlusspruefung 28.11.2026)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, ' ')
+    .replace(/[\u{E0000}-\u{E007F}]/gu, '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 200)

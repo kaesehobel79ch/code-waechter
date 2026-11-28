@@ -9,8 +9,14 @@ import { gameChecks } from './spiele'
 import { windowsChecks } from './windows'
 import { HARD_CODE, hardeningChecks, type HardFinding } from './haertung'
 import { clearExeCache, isAbsolute, resolveExe } from './prozess'
-import { berichtBlock, berichtNeu, scannen } from './sicherheit'
+import { berichtBlock, berichtNeu, berichtScanBlock, scannen, scannenOrdner } from './sicherheit'
 import type { Ergebnis, Umgebung } from './sicherheit'
+import { TEXT_DATEI, textBefunde, zusatzBefunde } from './zusatz'
+import { istPaketDatei, neuePakete, paketePruefen } from './pakete'
+import type { PaketUmgebung } from './pakete'
+import { istPruefdatei, testBetrug } from './testbetrug'
+import { clangTidyNeben } from './c_analyse'
+import type { CWerkzeuge } from './c_analyse'
 
 // Code-Wächter: prüft jede Datei, die Claude mit Write oder Edit schreibt, gleich nach dem Schreiben.
 // Gefundene Fehler gehen als Hinweis an Claude (context des Werkzeugergebnisses), damit sie sofort behoben werden.
@@ -55,6 +61,8 @@ type Kind =
   | 'einstellung'
   // Sprachen, für die es (noch) kein Prüfprogramm gibt: offen NICHT GEPRÜFT statt still nichts
   | 'nochecker'
+  // Text- und Regeldateien (.md, .txt) mit unsichtbaren Zeichen (27.11.2026); steht nicht in KINDS, saubere Textdateien bleiben still
+  | 'text'
 
 const KINDS: Record<string, Kind[]> = {
   py: ['python'],
@@ -303,6 +311,10 @@ for (const ext of Object.keys(NO_CHECKER)) KINDS[ext] = KINDS[ext] ?? ['nochecke
 function kindsOf(file: string): Kind[] | undefined {
   const named = NAME_KINDS[baseName(file).toLowerCase()]
   if (named) return named.kinds
+  // Paketlisten von pip (requirements.txt, requirements-dev.txt ...): Zugangsdaten wie eine Einstellungsdatei, dazu neue Pakete (pakete.ts)
+  if (/^requirements[^\\/]*\.txt$/i.test(baseName(file))) return ['einstellung']
+  // Sperrdateien von Python und yarn: sonst ohne Dateiart, der OSV-Scanner (osv.ts, OSV_DATEI) erreichte sie nie (Gegenprüfung 28.11.2026)
+  if (/^(?:poetry|Pipfile|pdm|uv|yarn)\.lock$/i.test(baseName(file))) return ['einstellung']
   const m = /\.([^.\\]+)$/.exec(file)
   return m ? KINDS[m[1].toLowerCase()] : undefined
 }
@@ -1734,6 +1746,22 @@ async function wpfProject($: any, project: string, projText: string): Promise<Wp
 // Stilfragen (Namen, Dokumentation, "Non-nullable ...") bleiben weg, damit nichts zugemüllt wird.
 // Ohne CA5394 (Random ist in Spielen kein Sicherheitsfehler) und CA5400 (Sperrlisten-Abfrage, scheitert ohne Netz).
 const CS_HINT = /^(?:CS0168|CS0219|CS0162|CS0169|CS0414|CS0649|CS1998|CS4014|CS8602|CS8604|CS8600|CA(?:1001|18\d\d|20\d\d|21\d\d|22\d\d|23\d\d|3\d{3}|5(?!394|400)\d{3}))$/
+// Die eingeschalteten Regeln von Meziantou.Analyzer (MA_REGELN, alle als Vorschlag) zählen nur, wenn das Werkzeug geladen ist:
+// bindet ein Projekt Meziantou selbst ein, kämen sonst seine eigenen MA-Meldungen dazu (Gegenprüfung 28.11.2026).
+const MA_HINT = /^MA(?:0009|0022|0042|0100|0129|0134|0147)$/
+const istHinweis = (w: Finding, maGeladen: boolean): boolean => !CS_ROT.test(w.code) && (CS_HINT.test(w.code) || (maGeladen && MA_HINT.test(w.code)))
+
+// Sicherheitsregeln des Übersetzers, die als Fehler gelten statt als Vorschlag (27.11.2026, Bauplan "höchstes Niveau",
+// Punkt 5): nur die "Do not ..."-Regeln, deren Fund fast nie absichtlich ist - unsichere Deserialisierung (CA23xx), Einschleusung
+// über den Datenfluss (CA3001-CA3012), XXE und XSLT-Skripte (CA3061, CA3075-CA3077), kaputte Verschlüsselung (CA5351), abgeschaltete
+// Zertifikats-, Anfrage- und Kopfzeilenprüfung (CA5359, CA5363, CA5365), alte TLS-Fassungen (CA5361, CA5364, CA5378, CA5397), ZIP Slip
+// (CA5389), eingebaute Schlüssel und Zertifikate (CA5390, CA5403), Wurzelzertifikat hinzufügen (CA5380), DSA (CA5384), zu kurze
+// RSA-Schlüssel (CA5385), schwache Schlüsselableitung (CA5373, CA5387), XslTransform (CA5374), festes IV (CA5401), Sperrlisten-
+// und Token-Prüfung aus (CA5399, CA5404, CA5405). Liste und Titel: github.com/dotnet/docs, quality-rules/security-warnings.md
+// (gelesen 27.11.2026). Als Vorschlag bleiben die "Ensure/Review"-Regeln, CA5350 (schwache Verfahren, oft nur Prüfsummen) und CA5358
+// (ECB: ein Programm nutzt es richtig als Baustein für AES-CTR). Gemessen 27.11.2026: CA5389 schlägt in Desktop-Code an.
+export const CS_ROT = /^CA(?:230[015]|231[015]|2321|232[679]|235[246]|300[1-46-9]|301[0-2]|3061|307[5-7]|5351|5359|536[0135]|5364|5373|5374|5378|5380|5384|5385|5387|5389|5390|5397|5399|5401|5403|5404|5405)$/
+const zuFehler = (w: Finding): boolean => w.code === 'CA2241' || CS_ROT.test(w.code)
 
 // MSBuild liest beim Bau auch Dateien aus den Ordnern ÜBER dem Projekt, bis zum Laufwerk (Directory.Build.props/.targets,
 // Directory.Packages.props, Directory.Build.rsp; global.json wählt SDKs). Darin kann ein eigener Bauschritt stehen. Liegt so eine
@@ -1781,15 +1809,56 @@ const SLOW_OFF_NOTE = (): string =>
   )
 const xmlText = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
+// Meziantou.Analyzer (Bauplan "höchstes Niveau" Stufe 2 Punkt 12, 27.11.2026 "Alle drei Stufen"): nur wenn mit
+// /waechter-werkzeuge install meziantou geladen. Eingeschaltet sind nur die Regeln des Auftrags (Doku der Fassung 3.0.342 gelesen
+// 28.11.2026: github.com/meziantou/Meziantou.Analyzer, docs/Rules/MAxxxx.md):
+//   MA0009 Regex ohne Zeitlimit (ReDoS)                MA0022 Task-Methode ohne async gibt null zurück
+//   MA0042 blockierender Aufruf (.Result, .Wait(), Thread.Sleep) in einer async-Methode
+//   MA0100 Task zurückgegeben, bevor using es abwartet  MA0129 Task statt seines Ergebnisses im using
+//   MA0134 Ergebnis eines async-Aufrufs unbeachtet      MA0147 async-Lambda für einen void-Delegaten
+// Alle übrigen MA-Regeln schaltet die Datei none.editorconfig des Pakets aus (global_level -100); die eigene .globalconfig (Stufe 0)
+// stellt die sieben auf warning, sonst zeigt dotnet build sie nicht. Alle sind Vorschläge (CS_HINT): keine meldet einen sicheren
+// Fehler beim Laufen (MA0022 meldet auch "Task?" und x?.MachAsync(), deren null der Aufrufer prüfen kann). Nicht dabei: MA0155 (jede
+// async void-Methode, auch die erlaubten Ereignis-Handler), MA0045, MA0032, MA0040 (keine Fehler, sondern Umbauten).
+// Die DLL wählt MSBuild wie NuGet nach der Fassung des Übersetzers ($(CompilerApiVersion), roslyn5.12 beim .NET-SDK 11.0.100):
+// die höchste, die nicht neuer ist; unter Roslyn 5.0 keine. Nur in C#-Projekten.
+const MA_REGELN = ['MA0009', 'MA0022', 'MA0042', 'MA0100', 'MA0129', 'MA0134', 'MA0147']
+const MA_DLL = /\\analyzers\\dotnet\\roslyn5\.9\\cs\\Meziantou\.Analyzer\.dll$/i
+const MA_FASSUNGEN: [string, string | undefined][] = [['5.9', undefined], ['5.6', '5.9'], ['5.0', '5.6']]
+
+// Zeilen für die eigene .globalconfig und die Einträge für die Einstellungsdatei; undefined, wenn das Paket nicht (ganz) da ist.
+async function meziantouSetup($: any): Promise<{ lines: string[]; items: string } | undefined> {
+  const dll = await toolPath($, 'meziantou')
+  if (!dll || !MA_DLL.test(dll)) return undefined
+  const dir = dll.replace(MA_DLL, '')
+  const none = `${dir}\\configuration\\none.editorconfig`
+  try {
+    if (!(await $.fs.exists(none))) return undefined
+  } catch {
+    return undefined
+  }
+  const api = '$(CompilerApiVersion.Substring(6))'
+  const dlls = MA_FASSUNGEN.map(([ab, bis]) => {
+    const cond = `$([MSBuild]::VersionGreaterThanOrEquals(${api}, '${ab}'))${bis ? ` and $([MSBuild]::VersionLessThan(${api}, '${bis}'))` : ''}`
+    return `    <Analyzer Include="${msbuildEscape(`${dir}\\analyzers\\dotnet\\roslyn${ab}\\cs\\Meziantou.Analyzer.dll`, true)}" Condition="${xmlText(cond)}" />\n`
+  })
+  const items =
+    `  <ItemGroup Condition="'$(Language)' == 'C#' and $(CompilerApiVersion.StartsWith('roslyn'))">\n` +
+    `    <GlobalAnalyzerConfigFiles Include="${msbuildEscape(none, true)}" />\n${dlls.join('')}  </ItemGroup>\n`
+  return { lines: MA_REGELN.map(r => `dotnet_diagnostic.${r}.severity = warning`), items }
+}
+
 // Schreibt eine Einstellungsdatei (eingelesen vor Microsoft.Common.props) und die zugehörige .globalconfig und liefert die
 // Schalter für dotnet build. Lässt sich das nicht schreiben, läuft der Bau ohne sie: Der Bau schreibt in denselben Ordner (obj,
 // out) und meldet dann selbst den Fehler; hängt er an den zwei Regeln, meldet die Zeitgrenze offen "nicht geprüft".
+// Ist Meziantou.Analyzer geladen, kommt er mit seinen Regeln dazu (meziantouSetup).
 async function analysisProps($: any, base: string, name: string, lines: string[]): Promise<string[]> {
   const globalConfig = `${base}/${name}.globalconfig`
   const props = `${base}/${name}.props`
+  const ma = await meziantouSetup($)
   try {
-    await $.fs.write(globalConfig, ['is_global = true', ...lines, ''].join('\n'))
-    await $.fs.write(props, `<Project>\n  <ItemGroup>\n    <GlobalAnalyzerConfigFiles Include="${xmlText(globalConfig)}" />\n  </ItemGroup>\n</Project>\n`)
+    await $.fs.write(globalConfig, ['is_global = true', ...lines, ...(ma?.lines ?? []), ''].join('\n'))
+    await $.fs.write(props, `<Project>\n  <ItemGroup>\n    <GlobalAnalyzerConfigFiles Include="${xmlText(globalConfig)}" />\n  </ItemGroup>\n${ma?.items ?? ''}</Project>\n`)
   } catch {
     return []
   }
@@ -1809,7 +1878,10 @@ function dotnetBuild($: any, project: string, base: string, props: string[], res
       'dotnet', 'build', ...(restore ? [] : ['--no-restore']), '--no-incremental', '-nologo', '-v:q', '-clp:NoSummary', '-nodeReuse:false',
       // AnalysisModeSecurity=All: "Recommended" allein meldet ECB, eine Zertifikatsprüfung "immer true" (ServicePointManager) und
       // zu wenige Runden beim Ableiten aus einem Kennwort nicht (gemessen 18.11.2026, .NET 10).
-      '-p:TreatWarningsAsErrors=false', '-p:WarningsAsErrors=', '-p:EnableNETAnalyzers=true', '-p:AnalysisLevel=latest', '-p:AnalysisMode=Recommended', '-p:AnalysisModeSecurity=All',
+      // RunAnalyzers/RunAnalyzersDuringBuild: steht in der Projektdatei RunAnalyzers=false, liefe sonst keine Analyse-Regel (auch die
+      // roten Sicherheitsregeln nicht) - Microsoft.Managed.Core.targets setzt dann _SkipAnalyzers (Gegenprüfung 28.11.2026, SDK 11.0.100).
+      '-p:TreatWarningsAsErrors=false', '-p:WarningsAsErrors=', '-p:EnableNETAnalyzers=true', '-p:RunAnalyzers=true', '-p:RunAnalyzersDuringBuild=true',
+      '-p:AnalysisLevel=latest', '-p:AnalysisMode=Recommended', '-p:AnalysisModeSecurity=All',
       '-p:UseSharedCompilation=false', '-p:PreBuildEvent=', '-p:PostBuildEvent=', `-p:IntermediateOutputPath=${base}/obj/`, `-p:OutDir=${base}/out/`,
       ...props, project,
     ],
@@ -1855,13 +1927,14 @@ async function buildProject($: any, project: string, file: string): Promise<Outc
   }
   // CA2241 (falsche Platzhalter wie "{0} {1}" mit einem Wert, "{0") ist nur eine Warnung, stürzt aber sicher ab (FormatException,
   // gemessen 25.10.2026): darum ein Fehler.
-  const findings = [...parseCompiler(text), ...parseCompiler(text, undefined, 'warning').filter(w => w.code === 'CA2241')]
+  const findings = [...parseCompiler(text), ...parseCompiler(text, undefined, 'warning').filter(zuFehler)]
   if (r.exitCode !== 0 && findings.length === 0) {
     const m = /error\s+([A-Z]+\d+):\s*(.*)/.exec(text)
     return unchecked(what, m ? daten(`${m[1]} ${m[2].replace(/\s*\[[^\]]+\]\s*$/, '')}`, 160) : t(`dotnet endete mit Code ${r.exitCode}`, `dotnet exited with code ${r.exitCode}`))
   }
   if (findings.length === 0 && r.truncated) return unchecked(what, TRUNCATED())
-  const hints = parseCompiler(text, undefined, 'warning').filter(w => CS_HINT.test(w.code))
+  const maGeladen = (await meziantouSetup($)) !== undefined
+  const hints = parseCompiler(text, undefined, 'warning').filter(w => istHinweis(w, maGeladen))
   const v = withHints(verdict(what, findings, file), hints, file)
   if (v.status !== 'ok' || !/\.(cs|vb|fs|fsi|fsx)$/i.test(file) || norm(file).toLowerCase() === norm(project).toLowerCase()) return withSlowNote(v)
   // Ein Lauf ohne Meldung beweist nichts, wenn das Projekt die Datei gar nicht übersetzt (Compile Remove, eigene Dateiliste;
@@ -2124,11 +2197,12 @@ async function looseRun($: any, files: string[], base: string, settings: LooseSe
     if (code !== 'CS5001' && !POS.test(raw.trim())) unplaced.push(code)
   }
   const noMain = /\berror\s+CS5001\b/.test(text)
-  const found = [...parseCompiler(text), ...parseCompiler(text, undefined, 'warning').filter(w => w.code === 'CA2241')].filter(f => f.code !== 'CS5001')
+  const found = [...parseCompiler(text), ...parseCompiler(text, undefined, 'warning').filter(zuFehler)].filter(f => f.code !== 'CS5001')
   if (r.exitCode !== 0 && found.length === 0 && unplaced.length === 0 && !noMain) {
     return { ok: false, reason: t(`dotnet endete mit Code ${r.exitCode} ohne Fehlerzeile`, `dotnet exited with code ${r.exitCode} without an error line`) }
   }
-  return { ok: true, found, unplaced, hints: parseCompiler(text, undefined, 'warning').filter(w => CS_HINT.test(w.code)), bodies: r.exitCode === 0 || noMain, slowOff }
+  const maGeladen = (await meziantouSetup($)) !== undefined
+  return { ok: true, found, unplaced, hints: parseCompiler(text, undefined, 'warning').filter(w => istHinweis(w, maGeladen)), bodies: r.exitCode === 0 || noMain, slowOff }
 }
 
 // Unbekannte Namen aus den Fehlertexten ('Foo' could not be found), als Daten gekennzeichnet.
@@ -2190,7 +2264,7 @@ async function checkCsLoose($: any, file: string, project: string | undefined, w
   const projectUsing = (f: Finding): boolean => LOOSE_GLOBAL_USINGS.test(f.file) && LOOSE_MISSING.test(f.code)
   const mineOf = (r: { found: Finding[] }): Finding[] => r.found.filter(f => (same(f.file, file) || projectUsing(f)) && !ignored(f))
   // Ein echter Fehler (keine Warnung wie CA2241) in einer anderen Datei des Laufs.
-  const otherErrors = (r: { found: Finding[] }): boolean => r.found.some(f => !same(f.file, file) && !projectUsing(f) && f.code !== 'CA2241')
+  const otherErrors = (r: { found: Finding[] }): boolean => r.found.some(f => !same(f.file, file) && !projectUsing(f) && !zuFehler(f))
 
   // Das Umfeld: die Dateien des Projekts oder die übrigen C#-Dateien des Ordners.
   const neighbours = async (): Promise<string[]> => {
@@ -2995,18 +3069,31 @@ async function checkTypeScript($: any, file: string, jsOnly = false): Promise<Ou
 
 // ESLint (falls geladen): Vorschläge und Logikfehler in JavaScript mit den empfohlenen Regeln. Die Einstellungen kommen allein aus
 // der eigenen Datei der Mod; Einstellungen oder Erweiterungen des Projekts werden nie geladen (sie könnten Code ausführen).
-const ESLINT_CONFIG = [
-  "import js from '@eslint/js'",
-  "import globals from 'globals'",
-  'export default [',
-  '  js.configs.recommended,',
-  '  {',
-  "    languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: { ...globals.browser, ...globals.node } },",
-  "    rules: { 'no-unused-vars': 'warn', 'no-undef': 'warn', 'prefer-const': 'warn', 'no-var': 'warn', eqeqeq: ['warn', 'smart'] },",
-  '  },',
-  ']',
-  '',
-].join('\n')
+// plugin: eslint-plugin-no-unsanitized ist geladen (Bauplan "höchstes Niveau" Stufe 2 Punkt 12; /waechter-werkzeuge install
+// nounsanitized). Er liegt im Werkzeugordner neben ESLint (werkzeuge.ts, exe "nounsanitized\index.js"), die Einstellungsdatei im
+// Ordner von ESLint: darum der feste Pfad "../nounsanitized/index.js", kein Pfad aus der Einstellung im Text.
+const eslintConfig = (plugin: boolean): string =>
+  [
+    "import js from '@eslint/js'",
+    "import globals from 'globals'",
+    ...(plugin ? ["import noUnsanitized from '../nounsanitized/index.js'"] : []),
+    'export default [',
+    '  js.configs.recommended,',
+    '  {',
+    ...(plugin ? ["    plugins: { 'no-unsanitized': noUnsanitized },"] : []),
+    "    languageOptions: { ecmaVersion: 'latest', sourceType: 'module', globals: { ...globals.browser, ...globals.node } },",
+    `    rules: { 'no-unused-vars': 'warn', 'no-undef': 'warn', 'prefer-const': 'warn', 'no-var': 'warn', eqeqeq: ['warn', 'smart']${plugin ? ", 'no-unsanitized/method': 'warn', 'no-unsanitized/property': 'warn'" : ''} },`,
+    '  },',
+    ']',
+    '',
+  ].join('\n')
+// Die zwei Regeln des Plugins: HTML aus nicht festem Text in innerHTML/outerHTML (property) und in insertAdjacentHTML,
+// document.write/writeln, createContextualFragment, setHTMLUnsafe, import() (method). Vorschlag, kein Fehler: die Regel sieht nicht,
+// ob der Text vorher entschärft wurde, und der Code läuft (kein sicherer Laufzeitfehler). Als Fehler bleiben die eigenen Muster:
+// SEC-XSS (innerHTML/document.write mit zusammengesetztem oder fremdem Text) und JS-XSS (insertAdjacentHTML, createContextualFragment
+// mit Text aus der Anfrage, js_worker.ts). Gemessen 28.11.2026 an einer Probe: eine einfache Variable (el.innerHTML = name) melden
+// nur die zwei Regeln des Plugins.
+const ESLINT_PLUGIN_RULES = /^no-unsanitized\/(?:method|property)$/
 
 // Eine Hilfsdatei nur schreiben, wenn sie fehlt oder anders lautet: ein zweiter Chat liest sie sonst womöglich halb geschrieben.
 async function writeIfChanged($: any, path: string, text: string): Promise<void> {
@@ -3032,8 +3119,9 @@ async function eslintCheck($: any, file: string): Promise<DeepCheck> {
   const node = await findTool($, 'node', 'node', EXTERNAL.js?.places)
   if (!eslint || !node) return none
   const config = eslint.replace(/\\node_modules\\eslint\\bin\\eslint\.js$/i, '\\code-waechter.eslint.config.mjs')
+  const plugin = (await toolPath($, 'nounsanitized')) !== undefined
   try {
-    await writeIfChanged($, config, ESLINT_CONFIG)
+    await writeIfChanged($, config, eslintConfig(plugin))
   } catch {
     return { ...none, skipped: t('ESLint-Einstellungsdatei nicht schreibbar', 'ESLint config file not writable') }
   }
@@ -3051,10 +3139,11 @@ async function eslintCheck($: any, file: string): Promise<DeepCheck> {
     const out = { errors: [] as Finding[], hints: [] as Finding[] }
     for (const m of res.flatMap(x => x.messages)) {
       if (m.fatal || !m.ruleId) continue
-      // Die Mod lädt nur Kernregeln (Kleinbuchstaben und Bindestrich). Einen anderen Namen kann nur die Datei selbst liefern
-      // (unbekannte Regel in einem eslint-Kommentar): er wird nicht als Code übernommen.
+      // Die Mod lädt Kernregeln (Kleinbuchstaben und Bindestrich) und, falls geladen, die zwei Regeln von no-unsanitized. Einen
+      // anderen Namen kann nur die Datei selbst liefern (unbekannte Regel in einem eslint-Kommentar): er wird nicht als Code übernommen.
       const id = String(m.ruleId)
-      const f = { file, line: m.line ?? 0, col: m.column ?? 0, code: /^[a-z][a-z0-9-]{0,59}$/.test(id) ? id : 'ESLint', text: m.message }
+      const known = /^[a-z][a-z0-9-]{0,59}$/.test(id) || (plugin && ESLINT_PLUGIN_RULES.test(id))
+      const f = { file, line: m.line ?? 0, col: m.column ?? 0, code: known ? id : 'ESLint', text: m.message }
       if (ESLINT_ERRORS.test(f.code) || (f.code === 'no-undef' && isModule)) out.errors.push(f)
       else out.hints.push(f)
     }
@@ -3332,8 +3421,8 @@ async function checkTreeSitter($: any, file: string, given?: TsLang): Promise<Ou
   // ein anderes bleibt offen ungeprüft (sonst meldet Starlark gültigen Code als sicheren Fehler).
   if (!given && /(^|[\\/])(build|workspace)$/i.test(file)) {
     const head = ((await readText($, file)) ?? '').slice(0, 512)
-    if (/^﻿?#!/.test(head)) {
-      return /^﻿?#!.*\b(ba|z|k|da)?sh\b/.test(head)
+    if (/^\ufeff?#!/.test(head)) {
+      return /^\ufeff?#!.*\b(ba|z|k|da)?sh\b/.test(head)
         ? checkBash($, file)
         : unchecked(t('Sprachpakete', 'language packages'), t('Skript mit #!-Zeile, kein Bazel', 'script with #! line, not Bazel'))
     }
@@ -3368,7 +3457,7 @@ const BATCH_EXIT = /^\s*@?(exit(\s+\/b)?(\s+\S+)?|goto\s+:?eof)\s*$/i
 // "using" nur in der Form von PowerShell (using namespace/module/assembly); "using System;" ist C#.
 const PS_START = /^\s*(#|<#|\$|param\s*\(|function\s|\[|using\s+(namespace|module|assembly)\s|set-|add-type)/i
 function batchMix(text: string): BatchMix | undefined {
-  const lines = text.replace(/^﻿/, '').split(/\r?\n/)
+  const lines = text.replace(/^\ufeff/, '').split(/\r?\n/)
   if (/^\s*<#\s*:/.test(lines[0] ?? '')) {
     const end = lines.findIndex((l, i) => i > 0 && /^\s*#>/.test(l))
     return end > 0 ? { batchFrom: 1, batchTo: end, psFrom: 0 } : undefined
@@ -3391,14 +3480,14 @@ async function checkBatch($: any, file: string): Promise<Outcome> {
   const text = await readText($, file)
   const mix = text === undefined ? undefined : batchMix(text)
   if (!text || !mix) return checkTreeSitter($, file)
-  const lines = text.replace(/^﻿/, '').split(/\r?\n/)
+  const lines = text.replace(/^\ufeff/, '').split(/\r?\n/)
   const base = `${await sessionDir($)}\\mix_${shortHash(norm(file).toLowerCase())}`
   const batchFile = `${base}${/\.bat$/i.test(file) ? '.bat' : '.cmd'}`
   const psFile = `${base}.ps1`
   try {
     await $.fs.write(batchFile, lines.map((l, i) => (i >= mix.batchFrom && i < mix.batchTo ? l : '')).join('\r\n'))
     // Kopfmarke: Windows PowerShell 5.1 liest eine Datei ohne sie im Windows-Zeichensatz (typografische Anführungszeichen zählen sonst nicht).
-    await $.fs.write(psFile, `﻿${lines.map((l, i) => (i >= mix.psFrom ? l : '')).join('\r\n')}`)
+    await $.fs.write(psFile, `\ufeff${lines.map((l, i) => (i >= mix.psFrom ? l : '')).join('\r\n')}`)
   } catch (e) {
     return unchecked(t('Batch mit PowerShell', 'Batch with PowerShell'), t('Hilfsdatei nicht anlegbar: ', 'helper file could not be written: ') + String(e))
   }
@@ -3948,6 +4037,13 @@ const SECRET_RULES: Rule[] = [
   { re: /\bxox[baprs]-[A-Za-z0-9-]{10,}/, code: 'SEC-GEHEIMNIS', text: ['Slack-Zugangstoken steht im Code', 'Slack token in the code'] },
   { re: /\bAIza[0-9A-Za-z_-]{35}\b/, code: 'SEC-GEHEIMNIS', text: ['Google-API-Schlüssel steht im Code', 'Google API key in the code'] },
   { re: /\bsk-(?:ant-)?[A-Za-z0-9_-]{32,}\b/, code: 'SEC-GEHEIMNIS', text: ['API-Schlüssel (sk-…) steht im Code', 'API key (sk-…) in the code'] },
+  // Stripe (27.11.2026, Crashtest Lücke L5): ein Live-Schlüssel ist immer echt, egal wie zufällig der Rest aussieht.
+  { re: /\b[sr]k_live_[A-Za-z0-9]{10,}/, code: 'SEC-GEHEIMNIS', text: ['Stripe-Live-Schlüssel (sk_live_/rk_live_) steht im Code', 'Stripe live key (sk_live_/rk_live_) in the code'] },
+  // Cloudflare (27.11.2026, Bauplan Punkt 7): neue Formate cfk_ (Global API Key), cfut_ (User API Token), cfat_ (Account
+  // API Token), je Präfix + 40 Zeichen + Prüfsumme; cfoat_ ist das OAuth-Token von "wrangler login". Gitleaks kennt nur die alten
+  // Cloudflare-Formate (und nur neben dem Wort "cloudflare") und bekommt keine neuen Regeln mehr ("feature complete").
+  // Beleg: developers.cloudflare.com/fundamentals/api/get-started/token-formats (gelesen 27.11.2026).
+  { re: /\bcf(?:k|ut|at|oat)_[A-Za-z0-9]{40,}/, code: 'SEC-GEHEIMNIS', text: ['Cloudflare-Schlüssel oder -Token (cfk_/cfut_/cfat_/cfoat_) steht im Code', 'Cloudflare key or token (cfk_/cfut_/cfat_/cfoat_) in the code'] },
 ]
 
 const COMMENT_LINE = /^\s*(?:\/\/|#|\*|\/\*|<!--)/
@@ -4413,6 +4509,8 @@ async function runKind($: any, kind: Kind, file: string): Promise<Outcome> {
       return checkMatlab($, file)
     case 'einstellung':
       return { status: 'ok', what: t('Einstellungsdatei (Zugangsdaten)', 'settings file (secrets)'), others: [] }
+    case 'text':
+      return { status: 'ok', what: t('Textdatei (unsichtbare Zeichen)', 'text file (invisible characters)'), others: [] }
     case 'nochecker':
       return noChecker(NO_CHECKER[/\.([^.\\]+)$/.exec(file)?.[1].toLowerCase() ?? ''] ?? baseName(file))
   }
@@ -4428,7 +4526,7 @@ async function checkFile($: any, file: string, kinds: Kind[]): Promise<Outcome> 
 // Eine Größengrenze gibt es nicht: die Prüfer lesen die Datei selbst, die Mod liest große Dateien in Stücken (readLargeText).
 // Qt-Übersetzungsdateien (Linguist) haben die Endung .ts, sind aber XML: sie beginnen mit <?xml oder <!DOCTYPE TS>. Ein blosses
 // "<TS>" zählt nicht: in TypeScript ist "<TS>wert" eine gültige Typumwandlung, sonst schaltete so eine Zeile tsc ab.
-const QT_LINGUIST = /^﻿?\s*<(\?xml|!DOCTYPE\s+TS\b)/
+const QT_LINGUIST = /^\ufeff?\s*<(\?xml|!DOCTYPE\s+TS\b)/
 
 async function checkKinds($: any, file: string, kinds: Kind[]): Promise<Outcome> {
   let last: Outcome = unchecked(t('Prüfung', 'check'), t('keine Prüfung vorgesehen', 'no check available'))
@@ -4450,7 +4548,9 @@ async function checkKinds($: any, file: string, kinds: Kind[]): Promise<Outcome>
 function clip(s: string, n: number): string {
   const x = s
     .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '')
-    .replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]/g, ' ')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, ' ')
+    // Unicode-Tags (U+E0000-U+E007F) ganz weg: unsichtbarer Text für eine KI (Gegenprüfung 28.11.2026: stand sonst im Bericht)
+    .replace(/[\u{E0000}-\u{E007F}]/gu, '')
     .replace(/\s+/g, ' ')
     .trim()
   return x.length > n ? `${x.slice(0, n - 1)}…` : x
@@ -4489,6 +4589,8 @@ const OWN_CODES = new Set([
   'SEC-BEFEHL', 'SEC-EVAL', 'SEC-EXTRACT', 'SEC-GEHEIMNIS', 'SEC-INCLUDE', 'SEC-PFAD', 'SEC-PREGE', 'SEC-SQL', 'SEC-TLS',
   'SEC-UNSERIALIZE', 'SEC-WEITERLEITUNG', 'SEC-XSS', 'UNITY', 'UNREAL', 'UHT', 'GIT', HARD_CODE,
   'HARMONY-UNPATCH', 'HARMONY-ID', 'HARMONY-STATISCH', 'PROCESS-START',
+  // pakete.ts: der Paketname steht im Text schon in «…»
+  'PAKET-UNBEKANNT', 'PAKET-VERSION', 'PAKET-NAME',
 ])
 const isOwn = (code: string): boolean => OWN_CODES.has(code)
 // Die Codes der Sicherheitsmuster auf Englisch, wenn die Meldungen englisch sind (intern bleiben die deutschen Namen).
@@ -4578,7 +4680,8 @@ function detail(o: Outcome): string {
 // Prüfung, kommt die Datei in die Warteliste, und ihr Ergebnis geht mit der nächsten Werkzeugmeldung an Claude.
 // sid: der Chat, der die Datei geschrieben hat. Ergebnisse der Warteliste und des Scans gehen nur an diesen Chat
 // (ohne erkennbaren Chat, sid leer, an den nächsten).
-type Queued = { file: string; kinds: Kind[]; sid: string }
+// alt = Inhalt vor dem Schreiben, nur bei Prüfdateien (testbetrug.ts vergleicht alt und neu)
+type Queued = { file: string; kinds: Kind[]; sid: string; alt?: string }
 type Pending = { sid: string; text: string }
 
 const MAX_QUEUE = 6
@@ -4788,9 +4891,9 @@ async function autoReport($: any, e: any, next: any): Promise<any> {
   return ran
 }
 
-// ---- Sicherheits-Scanner nach dem Schreiben (sicherheit.ts): DevSkim, Cppcheck, Bandit, Gitleaks und eigene Muster, je nach
-// Dateiart. Nur nach dem Schreiben (runCheck), nicht im /scan: ein Scan über ein ganzes Projekt würde sonst vier Programme je Datei
-// starten. Funde gehen gebündelt in <Ablage>\security-report.txt.
+// ---- Sicherheits-Scanner (sicherheit.ts): DevSkim, Cppcheck, Bandit, Gitleaks und eigene Muster, je nach Dateiart. Nach dem
+// Schreiben je Datei (runCheck, scannen), im /scan seit 27.11.2026 (Crashtest Lücke L1) einmal je Scanner über alle erreichten
+// Dateien (scanTarget, scannenOrdner). Funde gehen gebündelt in <Ablage>\security-report.txt.
 async function scannerOrt($: any, name: 'devskim' | 'cppcheck' | 'gitleaks'): Promise<string | undefined> {
   const imPfad = await resolveExe($, name)
   if (imPfad) return imPfad
@@ -4815,6 +4918,39 @@ async function scannerOrt($: any, name: 'devskim' | 'cppcheck' | 'gitleaks'): Pr
   return undefined
 }
 
+// OSV-Scanner (osv.ts): winget legt ihn wie Gitleaks in seinen Paketordner und verweist aus WinGet\Links darauf (gemessen 27.11.2026, 2.7.1);
+// der Suchpfad der App gilt erst nach ihrem Neustart, darum beide Orte direkt.
+async function osvOrt($: any): Promise<string | undefined> {
+  const imPfad = await resolveExe($, 'osv-scanner')
+  if (imPfad) return imPfad
+  const lokal = String((await $.env.get('LOCALAPPDATA')) ?? '')
+  for (const o of [
+    `${lokal}\\Microsoft\\WinGet\\Packages\\Google.OSVScanner_Microsoft.Winget.Source_8wekyb3d8bbwe\\osv-scanner.exe`,
+    `${lokal}\\Microsoft\\WinGet\\Links\\osv-scanner.exe`,
+  ]) {
+    if (!isAbsolute(o)) continue
+    try {
+      if (await $.fs.exists(o)) return o
+    } catch {
+      // nicht lesbar: nächster Ort
+    }
+  }
+  return undefined
+}
+
+// C/C++-Analyse (c_analyse.ts): cl.exe und die Kopfdatei-Ordner wie bei der Übersetzungsprüfung, clang-tidy aus demselben Visual Studio.
+async function cWerkzeuge($: any): Promise<CWerkzeuge> {
+  clCache = clCache ?? discoverCl($)
+  const cl = await clCache
+  if (!cl) {
+    clCache = undefined
+    return {}
+  }
+  const tidy = clangTidyNeben(cl.cl)
+  // cKopf: dieselbe Regel wie die Übersetzungsprüfung (checkCppPlain), damit ein C-Kopf auch in der Analyse als C läuft
+  return { cl, cKopf: (f: string) => isCHeaderDir($, dirName(f)), ...(tidy && (await $.fs.exists(tidy)) ? { clangTidy: tidy } : {}) }
+}
+
 const scannerUmgebung = ($: any, kennung: string): Umgebung => ({
   kennung,
   run: (argv, opts) => sh($, argv, opts),
@@ -4825,21 +4961,53 @@ const scannerUmgebung = ($: any, kennung: string): Umgebung => ({
   write: async (p, text) => {
     await $.fs.write(p, text)
   },
+  // Nur der Spiegelordner des Ordner-Scans im Arbeitsordner der Mod (es gibt kein $.fs-Löschen); jeder andere Pfad bleibt unberührt.
+  leeren: async dir => {
+    if (!/\\code-waechter\\spiegel-[\w-]+$/i.test(dir) || !isAbsolute(dir)) return
+    await sh($, ['powershell', '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:CW_DIR -Recurse -Force -ErrorAction SilentlyContinue'], {
+      env: { CW_DIR: dir },
+      timeoutMs: 120000,
+    })
+  },
+  jetzt: () => $.clock.now(),
+  cAnalyse: () => cWerkzeuge($),
+  osv: () => osvOrt($),
 })
+
+async function berichtZeit($: any): Promise<string> {
+  const d = new Date(await $.clock.now())
+  const zwei = (n: number) => String(n).padStart(2, '0')
+  return `${zwei(d.getDate())}.${zwei(d.getMonth() + 1)}.${d.getFullYear()} ${zwei(d.getHours())}:${zwei(d.getMinutes())}:${zwei(d.getSeconds())}`
+}
 
 async function berichtSchreiben($: any, file: string, e: Ergebnis): Promise<void> {
   if (e.funde.length === 0) return
   const pfad = `${await ablage($)}\\security-report.txt`
-  const d = new Date(await $.clock.now())
-  const zwei = (n: number) => String(n).padStart(2, '0')
-  const zeit = `${zwei(d.getDate())}.${zwei(d.getMonth() + 1)}.${d.getFullYear()} ${zwei(d.getHours())}:${zwei(d.getMinutes())}:${zwei(d.getSeconds())}`
-  await $.fs.write(pfad, berichtNeu(await readText($, pfad), berichtBlock(zeit, norm(file), e)))
+  await $.fs.write(pfad, berichtNeu(await readText($, pfad), berichtBlock(await berichtZeit($), norm(file), e)))
 }
 
-async function withScanners($: any, file: string, out: Outcome): Promise<Outcome> {
+// Ein Block je Scan, nur wenn ein Scanner oder Muster etwas gefunden hat.
+async function berichtScanSchreiben($: any, titel: string, erg: Map<string, Ergebnis>): Promise<void> {
+  if (![...erg.values()].some(e => e.funde.length > 0)) return
+  const pfad = `${await ablage($)}\\security-report.txt`
+  await $.fs.write(pfad, berichtNeu(await readText($, pfad), berichtScanBlock(await berichtZeit($), titel, erg)))
+}
+
+async function withScanners($: any, file: string, out: Outcome, alt?: string): Promise<Outcome> {
   let e: Ergebnis
   try {
-    e = await scannen(scannerUmgebung($, await sidOf($)), norm(file), await readText($, file))
+    const text = await readText($, file)
+    e = await scannen(scannerUmgebung($, await sidOf($)), norm(file), text)
+    // Zusatzregeln der Stufe 1 (zusatz.ts); eine Text- oder Regeldatei ohne eigene Prüfung bekommt nur die unsichtbaren Zeichen.
+    // Bei Prüfdateien dazu der Vergleich mit dem Stand vor dem Schreiben (testbetrug.ts).
+    if (text !== undefined) {
+      const zusatz = [...(kindsOf(file) ? zusatzBefunde(text, norm(file)) : textBefunde(text, norm(file))), ...testBetrug(alt, text, norm(file))]
+      if (zusatz.length > 0) {
+        e.funde.push(...zusatz)
+        e.funde.sort((a, b) => a.line - b.line || a.col - b.col)
+        if (!e.liefen.includes(t('Muster', 'patterns'))) e.liefen.push(t('Muster', 'patterns'))
+      }
+    }
   } catch (err) {
     const gap = t('Sicherheits-Scanner (interner Fehler: ', 'security scanners (internal error: ') + clip(String((err as { message?: string })?.message ?? err), 120) + ')'
     return out.status === 'ok' ? { ...out, limit: out.limit ? `${out.limit}; ${gap}` : gap } : out
@@ -4869,8 +5037,70 @@ async function withScanners($: any, file: string, out: Outcome): Promise<Outcome
   return withHints(mitLuecke, leicht, file)
 }
 
+// ---- Neue Pakete (pakete.ts, 27.11.2026): nach dem Schreiben einer Paketliste fragt der Wächter für jedes Paket, das vorher
+// nicht drinstand, die offizielle Paketquelle (nur der Paketname geht hinaus). Den alten Inhalt liest guarded bzw. guardedShell VOR dem
+// Werkzeug; ist er unbekannt, zählen alle Pakete der Datei als neu. Im /scan fragt der Wächter keine Paketquelle (checkFile, nicht runCheck).
+// Schlüssel: Pfad klein. Der älteste noch nicht geprüfte Stand bleibt: wird die Datei zweimal geschrieben, bevor die Prüfung lief
+// (Warteliste), zählen die Pakete beider Schreibvorgänge. Höchstens PAKETE_VORHER_MAX Dateien zugleich (Befehle nennen Projektdateien
+// auch nur zum Lesen, z. B. dotnet build; deren Eintrag bleibt bis zum nächsten Schreiben stehen).
+const paketeVorher = new Map<string, string | undefined>()
+const PAKETE_VORHER_MAX = 100
+
+// true: dieser Aufruf hat den alten Inhalt gemerkt.
+async function paketeVorherMerken($: any, file0: string): Promise<boolean> {
+  const file = norm(file0)
+  const key = file.toLowerCase()
+  if (!istPaketDatei(file) || !kindsOf(file) || SKIP.test(file) || paketeVorher.has(key) || paketeVorher.size >= PAKETE_VORHER_MAX) return false
+  paketeVorher.set(key, await readText($, file))
+  return true
+}
+
+async function paketUmgebung($: any): Promise<PaketUmgebung> {
+  // Paketordner von NuGet: NUGET_PACKAGES geht vor %USERPROFILE%\.nuget\packages
+  // (learn.microsoft.com/nuget/consume-packages/managing-the-global-packages-and-cache-folders).
+  const eigen = String((await $.env.get('NUGET_PACKAGES')) ?? '')
+  const home = String((await $.env.get('USERPROFILE')) ?? '')
+  return {
+    run: (argv, opts) => sh($, argv, opts),
+    nugetOrdner: isAbsolute(eigen) ? eigen.replace(/\\+$/, '') : isAbsolute(home) ? `${home}\\.nuget\\packages` : '',
+    exists: async p => Boolean(await $.fs.exists(p)),
+  }
+}
+
+async function withPakete($: any, file: string, out: Outcome): Promise<Outcome> {
+  if (!istPaketDatei(file)) return out
+  const key = norm(file).toLowerCase()
+  const alt = paketeVorher.get(key)
+  paketeVorher.delete(key)
+  let r: Awaited<ReturnType<typeof paketePruefen>>
+  try {
+    const neu = await readText($, file)
+    const pakete = neu === undefined ? [] : neuePakete(alt, neu, norm(file))
+    if (pakete.length === 0) return out
+    r = await paketePruefen(await paketUmgebung($), pakete)
+  } catch (err) {
+    const gap = t('Paketprüfung (interner Fehler: ', 'package check (internal error: ') + clip(String((err as { message?: string })?.message ?? err), 120) + ')'
+    return out.status === 'ok' ? { ...out, limit: out.limit ? `${out.limit}; ${gap}` : gap } : out
+  }
+  const als = (f: (typeof r.funde)[number]): Finding => ({ file, line: f.line, col: f.col, code: f.code, text: f.text })
+  const schwer = r.funde.filter(f => f.schwer).map(als)
+  const leicht = r.funde.filter(f => !f.schwer).map(als)
+  const was = t('Pakete', 'packages')
+  if (out.status === 'fehler') return schwer.length > 0 ? { ...out, mine: [...out.mine, ...schwer] } : out
+  // Konnte die Grundprüfung nicht laufen, geht ein unbekanntes Paket trotzdem nie verloren.
+  if (out.status === 'ungeprueft') {
+    return schwer.length > 0
+      ? { status: 'fehler', what: `${out.what} + ${was} (${t('Grundprüfung nicht möglich', 'base check not possible')}: ${clip(out.reason, 160)})`, mine: schwer, others: [] }
+      : out
+  }
+  if (schwer.length > 0) return { status: 'fehler', what: `${out.what} + ${was}`, mine: schwer, others: out.others }
+  const gap = r.luecken.join('; ')
+  const mitLuecke: Outcome = gap === '' ? { ...out, what: `${out.what} + ${was}` } : { ...out, what: `${out.what} + ${was}`, limit: out.limit ? `${out.limit}; ${gap}` : gap }
+  return withHints(mitLuecke, leicht, file)
+}
+
 // Eine Prüfung samt Anzeige. Die Anzeige wird auch bei einem Fehler unterwegs zurückgesetzt.
-async function runCheck($: any, file: string, kinds: Kind[]): Promise<string> {
+async function runCheck($: any, file: string, kinds: Kind[], alt?: string): Promise<string> {
   const id = `p${++counter}`
   active++
   let outcome: Outcome = unchecked(t('Prüfung', 'check'), t('abgebrochen', 'aborted'))
@@ -4879,7 +5109,7 @@ async function runCheck($: any, file: string, kinds: Kind[]): Promise<string> {
     const t0 = await $.clock.now()
     await safe(update($, runningAtom, l => [...l, { id, file: baseName(file), kind: kinds[kinds.length - 1] }]))
     try {
-      outcome = await withScanners($, file, await checkFile($, file, kinds))
+      outcome = await withPakete($, file, await withScanners($, file, await checkFile($, file, kinds), alt))
     } catch (err) {
       outcome = unchecked(t('Prüfung', 'check'), t('interner Fehler: ', 'internal error: ') + String((err as { message?: string })?.message ?? err).slice(0, 140))
     }
@@ -4912,7 +5142,7 @@ async function runCheck($: any, file: string, kinds: Kind[]): Promise<string> {
 async function serveQueue($: any): Promise<void> {
   for (let item = queue.shift(); item !== undefined; item = queue.shift()) {
     try {
-      pushPending({ sid: item.sid, text: await runCheck($, item.file, item.kinds) })
+      pushPending({ sid: item.sid, text: await runCheck($, item.file, item.kinds, item.alt) })
     } catch {
       pushPending({
         sid: item.sid,
@@ -4933,9 +5163,15 @@ async function drain($: any): Promise<void> {
 }
 
 // Prüft eine Datei und liefert den Hinweistext für Claude; undefined bei Dateiarten, die nicht geprüft werden.
-async function checkOne($: any, file0: string): Promise<string | undefined> {
+async function checkOne($: any, file0: string, alt?: string): Promise<string | undefined> {
   const file = norm(file0)
-  const kinds = kindsOf(file)
+  let kinds = kindsOf(file)
+  // Text- und Regeldateien (CLAUDE.md, Merkdateien, Skills) haben keine eigene Prüfung. Enthalten sie unsichtbare Zeichen (versteckte
+  // Anweisungen an eine KI, "Rules File Backdoor"), wird die Datei als Textdatei geprüft und rot; saubere bleiben still wie bisher.
+  if (!kinds && TEXT_DATEI.test(file) && !SKIP.test(file)) {
+    const text = await readText($, file)
+    if (text !== undefined && textBefunde(text, file).length > 0) kinds = ['text']
+  }
   if (!kinds || SKIP.test(file)) return undefined
   const name = fileName(file)
   // Binärdatei mit der Endung einer Quelltextart: nicht prüfen und keine Zeile in der Seitenleiste; Claude erfährt es trotzdem.
@@ -4965,7 +5201,8 @@ async function checkOne($: any, file0: string): Promise<string | undefined> {
       )
       return withDataNote([t(`Code-Wächter ? ${name}: NICHT GEPRÜFT – zu viele Prüfungen warten.`, `Code Guard ? ${name}: NOT CHECKED – too many checks waiting.`)])
     }
-    queue.push({ file, kinds, sid })
+    // Steht die Datei schon in der Warteliste, bleibt dort der erste alte Stand (oben): verglichen wird mit dem Stand vor dem ersten Schreiben.
+    queue.push({ file, kinds, sid, alt })
     return withDataNote([
       t(
         `Code-Wächter … ${name}: wird nach der laufenden Prüfung geprüft; das Ergebnis kommt mit einer der nächsten Werkzeugmeldungen.`,
@@ -4977,7 +5214,7 @@ async function checkOne($: any, file0: string): Promise<string | undefined> {
   busy = true
   let text: string
   try {
-    text = await runCheck($, file, kinds)
+    text = await runCheck($, file, kinds, alt)
   } finally {
     // Kam während der Prüfung etwas in die Warteliste, läuft sie im Hintergrund weiter (busy bleibt gesetzt).
     if (queue.length > 0) void drain($)
@@ -5060,15 +5297,23 @@ async function kiNote(file: string, e: any): Promise<string | undefined> {
 
 // Write und Edit: die geschriebene Datei gleich nach dem Schreiben prüfen.
 async function guarded($: any, e: any, next: any): Promise<any> {
-  const ran = await next(e)
-  if (ran.deny !== undefined || ran.isError === true) return ran
   const file = String(e.file_path ?? '')
+  // Paketlisten: alter Inhalt vor dem Schreiben für "neue Pakete" (pakete.ts); ein Lesefehler hält das Schreiben nie auf.
+  const gemerkt = await paketeVorherMerken($, file).catch(() => false)
+  // Testbetrug: bei Prüfdateien den Inhalt VOR dem Schreiben lesen (nach next(e) ist er überschrieben); neue Datei: undefined.
+  const alt = file !== '' && istPruefdatei(norm(file)) ? await readText($, file).catch(() => undefined) : undefined
+  const ran = await next(e)
+  if (ran.deny !== undefined || ran.isError === true) {
+    if (gemerkt) paketeVorher.delete(norm(file).toLowerCase())
+    return ran
+  }
   let own: string | undefined
   try {
-    own = await checkOne($, file)
+    own = await checkOne($, file, alt)
   } catch (err) {
     return withContext(ran, [crashedNote(file, err)])
   }
+  if (own === undefined && gemerkt) paketeVorher.delete(norm(file).toLowerCase())
   // Die Erinnerung an offene Fehler und die KI-Fehlerarten sind Zugabe: fallen sie aus, kommt das Prüfergebnis trotzdem an.
   const reminder = own === undefined ? undefined : await openReminder($, norm(file)).catch(() => undefined)
   const ki = own === undefined ? undefined : await kiNote(norm(file), e).catch(() => undefined)
@@ -5142,6 +5387,8 @@ async function guardedShell($: any, e: any, next: any): Promise<any> {
       }
     }
   }
+  // Paketlisten, die der Befehl nennt: alter Inhalt für "neue Pakete" (pakete.ts).
+  for (const f of all.slice(0, MAX_SHELL_PATHS)) await paketeVorherMerken($, f).catch(() => false)
   const ran = await next(e)
   if (ran.deny !== undefined) return ran
   try {
@@ -5236,7 +5483,7 @@ async function guardedShell($: any, e: any, next: any): Promise<any> {
 // immer eins nach dem anderen. Jedes Projekt bekommt einen Fehlerbericht als Textdatei, den jeder Chat einlesen kann.
 // Hat das Projekt einen Projektleiter-Chat und läuft der gerade, bekommt er die Fehler sofort als Nachricht.
 type ScanTarget = { name: string; dir: string; leader: string }
-type ScanProblem = { file: string; line: number; col: number; code: string; text: string }
+type ScanProblem = { file: string; line: number; col: number; code: string; text: string; geheim?: boolean }
 type ScanSkipped = { file: string; reason: string }
 type ScanLimited = { file: string; reason: string }
 // projects: übersetzte Projektdateien (.csproj, .vbproj, .fsproj), compiled: Quelldateien, die beim Übersetzen eines Projekts mitgeprüft wurden,
@@ -5334,10 +5581,14 @@ async function readProjects($: any): Promise<{ list: ScanTarget[]; file: string 
 // limit: welche Grenze den Durchlauf beendet hat (Ordnerzahl oder Dateizahl). unreadable: Ordner, die sich nicht auflisten liessen
 // (auch der Startordner, wenn es ihn nicht gibt). links: Verknüpfungen (Junctions, Symlinks), denen der Scan nicht folgt; sie
 // können aus dem Ziel hinaus oder im Kreis führen.
-type FileList = { files: string[]; truncated: boolean; limit?: 'dirs' | 'files'; omitted: string[]; unreadable: string[]; links: string[] }
+// texts: Text- und Regeldateien ohne eigene Prüfung (.md, .txt; TEXT_DATEI), für die unsichtbaren Zeichen der Stufe 1. Sie haben eine
+// eigene Obergrenze (MAX_FILES) und verdrängen nie eine Code-Datei; textsCut: es gab mehr (Gegenprüfung 28.11.2026).
+type FileList = { files: string[]; texts: string[]; textsCut: boolean; truncated: boolean; limit?: 'dirs' | 'files'; omitted: string[]; unreadable: string[]; links: string[] }
 
 async function listFiles($: any, root: string): Promise<FileList> {
   const files: string[] = []
+  const texts: string[] = []
+  let textsCut = false
   const omitted: string[] = []
   const unreadable: string[] = []
   const links: string[] = []
@@ -5345,7 +5596,7 @@ async function listFiles($: any, root: string): Promise<FileList> {
   let seen = 0
   while (dirs.length > 0) {
     const dir = dirs.shift() as string
-    if (++seen > MAX_DIRS) return { files, truncated: true, limit: 'dirs', omitted, unreadable, links }
+    if (++seen > MAX_DIRS) return { files, texts, textsCut, truncated: true, limit: 'dirs', omitted, unreadable, links }
     let entries: { name: string; kind: string; isLink?: boolean }[] = []
     try {
       entries = await $.fs.list(dir)
@@ -5370,11 +5621,15 @@ async function listFiles($: any, root: string): Promise<FileList> {
         if (!SCAN_SKIP_DIR.test(x.name) && !(unity && UNITY_SKIP_DIR.test(x.name)) && !SKIP.test(`${p}\\`)) dirs.push(p)
       } else if (x.kind === 'file' && kindsFor(p) && !SKIP.test(p)) {
         files.push(p)
-        if (files.length >= MAX_FILES) return { files, truncated: true, limit: 'files', omitted, unreadable, links }
+        if (files.length >= MAX_FILES) return { files, texts, textsCut, truncated: true, limit: 'files', omitted, unreadable, links }
+      } else if (x.kind === 'file' && TEXT_DATEI.test(x.name) && !SKIP.test(p)) {
+        // Eigene Obergrenze: die Code-Dateien zählen weiter wie vor dem 28.11.2026, Text- und Regeldateien drängen keine weg
+        if (texts.length < MAX_FILES) texts.push(p)
+        else textsCut = true
       }
     }
   }
-  return { files, truncated: false, omitted, unreadable, links }
+  return { files, texts, textsCut, truncated: false, omitted, unreadable, links }
 }
 
 async function localTime($: any): Promise<string> {
@@ -5478,7 +5733,8 @@ async function writeReport(
       if (!sources.has(key)) sources.set(key, (await readText($, p.file))?.split(/\r?\n/) ?? [])
       const src = (sources.get(key) ?? [])[p.line - 1]
       lines.push(`${daten(rel(p.file), 200)}  ${where(p)}: ${p.code ? `${shownCode(p.code)} ` : ''}${isOwn(p.code) ? clip(p.text, 300) : daten(maskSecrets(p.text), 300)}`)
-      if (src !== undefined && p.code !== 'SEC-GEHEIMNIS') lines.push(`      > ${daten(maskSecrets(src), 200)}`)
+      // Fundstellen mit einem Geheimnis (Zugangsdaten, Gitleaks, Schlüssel-Muster): die Zeile wird nie gezeigt.
+      if (src !== undefined && p.code !== 'SEC-GEHEIMNIS' && p.geheim !== true) lines.push(`      > ${daten(maskSecrets(src), 200)}`)
     }
     const rest = Math.max(0, problems.length - MAX_REPORTED) + dropped
     if (rest > 0) lines.push(t(`… und ${rest} weitere Fehler.`, `… and ${rest} more errors.`))
@@ -5570,7 +5826,7 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
   try {
     const show = (text: string) => safe(update($, runningAtom, l => [...l.filter(x => x.id !== id), { id, file: text, kind: 'Scan' }]))
     await show(`Scan ${target.name}: ${t('Dateien werden gesucht', 'looking for files')}`)
-    const { files, truncated, limit, omitted, unreadable, links } = await listFiles($, target.dir)
+    const { files, texts, textsCut, truncated, limit, omitted, unreadable, links } = await listFiles($, target.dir)
     // Startordner fehlt oder ist nicht lesbar: nie "keine Fehler". Nicht lesbare Unterordner stehen unter "Nicht geprüft".
     const missing = unreadable.some(d => same(d, target.dir))
     for (const d of unreadable) {
@@ -5598,7 +5854,7 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
     const whyNotBuilt = new Map<string, string>()
     const unbuilt = new Set<string>() // Projektdateien, deren Bau nicht lief (nicht freigegeben) oder nicht geprüft endete
     let i = 0
-    const total = projects.length + files.length
+    const total = projects.length + files.length + texts.length
     let timedOut = false
     // Vor jedem Eintrag: erst die Warteliste der Sofortprüfung abarbeiten, dann die Zeitgrenze prüfen (nach ihr beginnt nichts Neues).
     // Die Anzeige wird nur bei jedem 10. Eintrag neu gezeichnet.
@@ -5740,6 +5996,79 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
       }
     }
     for (const f of await duplicateGuids($, files.filter(f => processed.has(norm(f).toLowerCase())))) add(f)
+    // Sicherheits-Scanner über alle erreichten Dateien (27.11.2026, Crashtest Lücke L1): je Scanner ein Aufruf, rote Funde in
+    // Bericht und Seitenleiste, alle Funde als ein Block in security-report.txt; dazu die KI-Fehlerarten (Geheimnisse, Lücken in C#)
+    // mit Zeile. Was nicht lief, steht bei der Datei unter "Nicht geprüft". Die Zeitgrenze des Scans gilt auch hier.
+    const binSet = new Set(binaries.map(b => norm(b).toLowerCase()))
+    const sicherDateien = files.filter(f => processed.has(norm(f).toLowerCase()) && !binSet.has(norm(f).toLowerCase()))
+    const sicherGrund = t('Sicherheits-Scanner: ', 'security scanners: ')
+    if (sicherDateien.length > 0 && (timedOut || (await $.clock.now()) - deadline >= SCAN_MAX_MS)) {
+      timedOut = true
+      for (const f of sicherDateien) skipped.push({ file: f, reason: sicherGrund + t('Zeitgrenze des Scans erreicht', 'scan time limit reached') })
+    } else if (sicherDateien.length > 0) {
+      await show(`Scan ${target.name}: ${t('Sicherheits-Scanner', 'security scanners')} (${sicherDateien.length} ${t('Dateien', 'files')})`)
+      const geheimZeilen = new Set(problems.filter(p => p.code === 'SEC-GEHEIMNIS').map(p => `${norm(p.file).toLowerCase()}|${p.line}`))
+      let erg: Map<string, Ergebnis> | undefined
+      try {
+        erg = await scannenOrdner(scannerUmgebung($, await sidOf($)), sicherDateien, {
+          restMs: SCAN_MAX_MS - ((await $.clock.now()) - deadline),
+          extra: (file, text) => [
+            ...zusatzBefunde(text, file),
+            ...hardeningChecks.kiSicherStellen(text, file).map(s => ({
+              line: s.line,
+              col: 1,
+              code: s.art === 'geheimnis' ? 'KI-GEHEIMNIS' : 'KI-SICHERHEIT',
+              text: s.art === 'geheimnis'
+                ? t(`eingebautes Geheimnis (${s.name}) - sofort entfernen, ein Schlüssel im Quelltext ist veröffentlicht`, `embedded secret (${s.name}) - remove it now, a key in source code is a published key`)
+                : t(`Sicherheitslücke (${s.name}) - sicher lösen, nicht abschalten`, `security hole (${s.name}) - solve it safely, do not switch the check off`),
+              schwer: true,
+              scanner: t('KI-Fehlerarten', 'AI error types'),
+              ...(s.art === 'geheimnis' ? { geheim: true } : {}),
+            })),
+          ],
+        })
+      } catch (err) {
+        const why = sicherGrund + t('interner Fehler: ', 'internal error: ') + clip(String((err as { message?: string })?.message ?? err), 120)
+        for (const f of sicherDateien) skipped.push({ file: f, reason: why })
+      }
+      if (erg) {
+        for (const [file, e] of erg) {
+          for (const f of e.funde) {
+            if (!f.schwer) continue
+            // Dasselbe Geheimnis nur einmal: steht die Zeile schon als Zugangsdaten rot, fallen Gitleaks und Muster dort weg.
+            if (f.geheim && geheimZeilen.has(`${norm(file).toLowerCase()}|${f.line}`)) continue
+            add({ file, line: f.line, col: f.col, code: f.code, text: `${f.scanner}: ${f.text}`, ...(f.geheim ? { geheim: true } : {}) })
+          }
+          // Ein Eintrag je Datei, auch wenn mehrere Scanner fehlten: "nicht geprüft" zählt Dateien.
+          if (e.luecken.length > 0) skipped.push({ file, reason: sicherGrund + [...new Set(e.luecken)].join('; ') })
+        }
+        await safe(berichtScanSchreiben($, `${target.name} (${target.dir})`, erg))
+      }
+    }
+    // Text- und Regeldateien (.md, .txt): nur die unsichtbaren Zeichen der Stufe 1, wie beim Schreiben (textBefunde). Seit 28.11.2026
+    // auch im /scan - vorher prüfte nur das Schreiben sie (eine Regeldatei mit verstecktem Text fiel im Scan durch). Nach den
+    // Sicherheits-Scannern, damit sie deren Zeit nicht verbrauchen; die Zeitgrenze des Scans gilt auch hier (tick).
+    for (const file of texts) {
+      if (!(await tick(baseName(file)))) break
+      if (await isBinary($, file)) {
+        binaries.push(file)
+        continue
+      }
+      const text = await readText($, file)
+      if (text === undefined) {
+        skipped.push({ file, reason: t('Datei nicht lesbar', 'file not readable') })
+        continue
+      }
+      count.single++
+      for (const f of textBefunde(text, norm(file))) if (f.schwer) add({ file, line: f.line, col: f.col, code: f.code, text: f.text })
+    }
+    if (textsCut) {
+      skipped.push({
+        file: target.dir,
+        reason: t(`mehr als ${MAX_FILES} Text- und Regeldateien (.md, .txt): die weiteren sind nicht auf unsichtbare Zeichen geprüft`,
+          `more than ${MAX_FILES} text and rule files (.md, .txt): the others were not checked for invisible characters`),
+      })
+    }
     const seconds = ((await $.clock.now()) - t0) / 1000
     const cut: CutReason[] = [...(limit ? [limit] : []), ...(timedOut ? (['time'] as const) : [])]
     const report = await writeReport($, target, problems, skipped, limited, count, cut, seconds, dropped, omitted, links, binaries)

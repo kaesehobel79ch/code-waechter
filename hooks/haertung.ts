@@ -633,4 +633,22 @@ export function kiBefunde(written: string, file: string): KiBefund[] {
   return befunde
 }
 
-export const hardeningChecks = { csHardeningHints, csThreatFindings, kiBefunde, kiPruefbar, kiMaxZeichen: KI_MAX_ZEICHEN }
+// Für den Scan (27.11.2026, Crashtest): eingebaute Geheimnisse und (C#) Sicherheitslücken der KI-Fehlerarten mit ihrer Zeile,
+// damit sie im Scanbericht rot stehen. Dieselben Regeln und Ausnahmen wie kiBefunde (markierte Zeilen, Prüfdateien, Kommentare in C#).
+export function kiSicherStellen(text: string, file: string): { line: number; art: 'geheimnis' | 'sicherheit'; name: string }[] {
+  if (!kiPruefbar(file) || KI_PRUEFDATEI.test(file)) return []
+  const out: { line: number; art: 'geheimnis' | 'sicherheit'; name: string }[] = []
+  const cs = /\.cs$/i.test(file)
+  text.split('\n').forEach((z, i) => {
+    if (KI_OK.test(z)) return
+    for (const [name, re] of KI_GEHEIMNISSE) if (re.test(z)) out.push({ line: i + 1, art: 'geheimnis', name })
+    if (cs) {
+      const k = kiKommentar(file, z)
+      const code = k === undefined ? z : z.slice(0, z.length - k.length)
+      for (const [name, re] of KI_SICHER_CS) if (re.test(code)) out.push({ line: i + 1, art: 'sicherheit', name })
+    }
+  })
+  return out
+}
+
+export const hardeningChecks = { csHardeningHints, csThreatFindings, kiBefunde, kiPruefbar, kiSicherStellen, kiMaxZeichen: KI_MAX_ZEICHEN }
