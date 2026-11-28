@@ -4,6 +4,7 @@ import {
   cMuster, geheimMuster, jsMuster, musterBefunde, pyPfadMuster, rein, scannen, scannenOrdner, scannerFuer,
 } from './sicherheit'
 import type { Lauf, Umgebung } from './sicherheit'
+import { KOPIER_AB, KOPIER_BEFEHL, kopierAufruf, spiegelZielOk, utf8Laenge, zeilenVon } from './sicherheit'
 
 // Ausgabe von DevSkim 1.0.90, gemessen am 20.11.2026 an einer Probedatei (Format -o "%L|%C|%S|%R|%N"; Spalte 0-basiert).
 const DEVSKIM_ECHT = [
@@ -28,6 +29,22 @@ test('DevSkim DS126858: md2 mitten in einem Namen ist kein schwacher Hash, MD5 a
   expect(devskimImWort(fund(1, zeilen[0].indexOf('md2') + 1), zeilen)).toBe(true)
   expect(devskimImWort(fund(2, zeilen[1].indexOf('MD5') + 1), zeilen)).toBe(false)
   expect(devskimImWort({ ...fund(1, zeilen[0].indexOf('md2') + 1), code: 'DS148264' }, zeilen)).toBe(false)
+})
+
+test('DevSkim DS106863: "DES" in einer Kommentarzeile ist das deutsche Wort, DES im Code bleibt rot', () => {
+  // Scan 28.11.2026, ein Prüfprogramm (Program.cs): Critical auf einem Kommentar.
+  const zeilen = [
+    '        // GEAENDERT AM ABEND DES 23.09.2026, nach einem Vorfall.',
+    '    var d = DES.Create();',
+    '    var d = DES.Create(); // DES ist alt',
+    '#define VERFAHREN "DES"',
+    '    *verfahren = "DES";',
+    '    var a = SymmetricAlgorithm.Create("DES");',
+    '/* alt */ var d = DES.Create();',
+    '    /// <summary>STAND DES BAUS</summary>',
+  ]
+  const fund = (line: number) => ({ line, col: (zeilen[line - 1] ?? '').indexOf('DES') + 1, code: 'DS106863', text: '', schwer: true, scanner: 'DevSkim' })
+  expect([1, 2, 3, 4, 5, 6, 7, 8].map(n => devskimImWort(fund(n), zeilen))).toEqual([true, false, false, false, false, false, false, true])
 })
 
 test('Cppcheck: error ist ein Fehler, unsicher und Stil sind Hinweise; Funde aus eingebundenen Dateien zählen nicht; Konfigurationsfehler sind eine Lücke', () => {
@@ -468,6 +485,179 @@ test('L1 Ordner-Scan: je Scanner ein Aufruf über alle Dateien, Funde gehen an d
   expect(imSpiegel).toContain(`${SP}\\0\\A.cs`)
   expect(geleert).toEqual([SP, SP])
   expect(Object.keys(dateien).some(k => k.startsWith(`${SP}\\`))).toBe(false)
+})
+
+// Scan 28.11.2026: 37 Dateien ab 4,79 MB "Kopie nicht anlegbar" - $.fs.write lehnt laut Schnittstelle alles über 4 MiB ab.
+test('Ordner-Scan: kann write eine Datei nicht schreiben, wird sie kopiert und geprüft; ohne Kopieren bleibt sie offen', async () => {
+  const gross = 'D:\\p\\netz.json'
+  // Über 4 MiB (nur dann kopiert der Wächter): 5'000'010 Bytes
+  const dateien: Record<string, string> = { [gross]: `{"k": "${'a'.repeat(5_000_000)}"}\n`, 'D:\\p\\klein.json': '{"a": 1}\n' }
+  const mitGitleaks = (argv: string[], d: Record<string, string>): Lauf => {
+    if (argv[0].endsWith('gitleaks.exe')) {
+      const im = Object.keys(d).filter(k => k.startsWith(`${SP}\\`)).map(k => k.slice(SP.length + 1).replace(/\\/g, '/'))
+      d[nach(argv, '--report-path')] = JSON.stringify(im.filter(k => k.endsWith('netz.json')).map(k => ({ RuleID: 'github-pat', Description: 'x', StartLine: 1, StartColumn: 8, File: `${SP.replace(/\\/g, '/')}/${k}` })))
+    }
+    return leer
+  }
+  const zuGross = (u: Umgebung, d: Record<string, string>) => {
+    u.write = async (p, text) => {
+      if (p.endsWith('netz.json')) throw new Error('write over 4 MiB rejects')
+      d[p] = text
+    }
+  }
+  const d1 = { ...dateien }
+  const mit = ordnerUmgebung(mitGitleaks, d1)
+  zuGross(mit.u, d1)
+  const kopiert: string[][] = []
+  mit.u.kopieren = async (von, ziel, fristMs) => {
+    kopiert.push([von, ziel, String(fristMs)])
+    d1[ziel] = d1[von] ?? ''
+  }
+  const e1 = await scannenOrdner(mit.u, Object.keys(dateien), { restMs: 60000 })
+  // Frist der Kopie: der Rest der Zeitgrenze (60 s), höchstens 120 s
+  expect(kopiert).toEqual([[gross, `${SP}\\0\\netz.json`, '60000']])
+  expect(e1.get(gross)?.luecken).toEqual([])
+  expect((e1.get(gross)?.funde ?? []).map(f => `${f.scanner}:${f.code}`)).toEqual(['Gitleaks:github-pat'])
+  // Ohne kopieren: offen mit dem Grund, ohne doppelte Vorsilbe "Sicherheits-Scanner:"
+  const d2 = { ...dateien }
+  const ohne = ordnerUmgebung(mitGitleaks, d2)
+  zuGross(ohne.u, d2)
+  const e2 = await scannenOrdner(ohne.u, Object.keys(dateien), { restMs: 60000 })
+  expect(e2.get(gross)?.luecken).toEqual(['Kopie nicht anlegbar (write over 4 MiB rejects)'])
+  expect(e2.get(gross)?.funde ?? []).toEqual([])
+})
+
+// Vierte Gegenprüfung 28.11.2026: nur eine grosse Datei wird kopiert; jeder andere Schreibfehler bleibt, wie er ist. Scheitert das
+// Kopieren, nennt die Lücke beide Gründe; die Nummer der gescheiterten Kopie wird nie für die nächste Datei benutzt.
+test('Ordner-Scan: kleine Datei mit Schreibfehler wird nicht kopiert; gescheiterte Kopie nennt beide Gründe und verbraucht ihre Nummer', async () => {
+  const gross = `{"k": "${'a'.repeat(5_000_000)}"}\n`
+  const d: Record<string, string> = { 'D:\\p\\a.json': gross, 'D:\\p\\b.json': gross, 'D:\\p\\klein.json': '{"a": 1}\n' }
+  const o = ordnerUmgebung((argv, dd) => {
+    if (argv[0].endsWith('gitleaks.exe')) {
+      // ein Fund für jede Datei im Spiegel, deren Inhalt "ghp_" enthält (nur die halbe Kopie von a.json)
+      const im = Object.keys(dd).filter(k => k.startsWith(`${SP}\\`) && (dd[k] ?? '').includes('ghp_'))
+      dd[nach(argv, '--report-path')] = JSON.stringify(im.map(k => ({ RuleID: 'github-pat', Description: 'x', StartLine: 1, StartColumn: 1, File: k.replace(/\\/g, '/') })))
+    }
+    return leer
+  }, d)
+  o.u.write = async (p, text) => {
+    if (p.endsWith('.json') && p.startsWith(`${SP}\\`)) throw new Error(p.endsWith('klein.json') ? 'Platte voll' : 'write over 4 MiB rejects')
+    d[p] = text
+  }
+  const kopiert: string[] = []
+  o.u.kopieren = async (von, ziel) => {
+    kopiert.push(von)
+    if (von.endsWith('a.json')) {
+      d[ziel] = 'ghp_halbe Kopie' // bleibt liegen, die Kopie scheitert danach
+      throw new Error('Zugriff verweigert')
+    }
+    d[ziel] = d[von] ?? ''
+  }
+  const e = await scannenOrdner(o.u, Object.keys(d).filter(k => k.startsWith('D:\\')), { restMs: 60000 })
+  expect(kopiert).toEqual(['D:\\p\\a.json', 'D:\\p\\b.json'])
+  expect(e.get('D:\\p\\klein.json')?.luecken).toEqual(['Kopie nicht anlegbar (Platte voll)'])
+  expect(e.get('D:\\p\\a.json')?.luecken).toEqual(['Kopie nicht anlegbar (write over 4 MiB rejects; Kopieren: Zugriff verweigert)'])
+  // Der Fund in der halben Kopie von a.json geht an niemanden, b.json ist sauber geprüft
+  expect(e.get('D:\\p\\b.json')?.funde ?? []).toEqual([])
+  expect(e.get('D:\\p\\b.json')?.luecken).toEqual([])
+  expect(e.get('D:\\p\\b.json')?.liefen).toContain('Gitleaks')
+  expect(e.get('D:\\p\\a.json')?.liefen ?? []).not.toContain('Gitleaks')
+  // Der leere Platz der gescheiterten Kopie erzeugt keinen Eintrag (fünfte Gegenprüfung: lief/luecke mit undefined)
+  expect([...e.keys()].sort()).toEqual(['D:\\p\\a.json', 'D:\\p\\b.json', 'D:\\p\\klein.json'])
+})
+
+test('Ordner-Scan: fehlt Gitleaks nach einer gescheiterten Kopie, steht die Lücke nur bei echten Dateien; ein langer Kopiergrund bleibt ganz', async () => {
+  const gross = `{"k": "${'a'.repeat(5_000_000)}"}\n`
+  const d: Record<string, string> = { 'D:\\p\\a.json': gross, 'D:\\p\\b.json': gross }
+  const o = ordnerUmgebung(() => leer, d, {}) // keine Programme da: Gitleaks fehlt
+  o.u.write = async (p, text) => {
+    if (p.startsWith(`${SP}\\`)) throw new Error('write over 4 MiB rejects')
+    d[p] = text
+  }
+  const lang = `${'F'.repeat(110)}ENDE`
+  o.u.kopieren = async (von, ziel) => {
+    if (von.endsWith('a.json')) throw new Error(lang)
+    d[ziel] = d[von] ?? ''
+  }
+  const e = await scannenOrdner(o.u, ['D:\\p\\a.json', 'D:\\p\\b.json'], { restMs: 60000 })
+  expect([...e.keys()].sort()).toEqual(['D:\\p\\a.json', 'D:\\p\\b.json'])
+  expect(e.get('D:\\p\\a.json')?.luecken).toEqual([`Kopie nicht anlegbar (write over 4 MiB rejects; Kopieren: ${lang})`])
+  expect(e.get('D:\\p\\b.json')?.luecken).toEqual(['Gitleaks fehlt (einmalig: winget install Gitleaks.Gitleaks)'])
+})
+
+test('UTF-8-Länge: wie TextEncoder (1, 2, 3 und 4 Bytes, einzelnes Ersatzzeichen 3)', () => {
+  expect(utf8Laenge('')).toBe(0)
+  expect(utf8Laenge('abc')).toBe(3)
+  expect(utf8Laenge('äöü')).toBe(6)
+  expect(utf8Laenge('€')).toBe(3)
+  expect(utf8Laenge('😀')).toBe(4)
+  expect(utf8Laenge('a\ud800b')).toBe(5)
+  expect(utf8Laenge('x'.repeat(4 * 1024 * 1024 + 1)) > KOPIER_AB).toBe(true)
+  expect(utf8Laenge('x'.repeat(KOPIER_AB)) > KOPIER_AB).toBe(false)
+})
+
+// Gegenprüfung 28.11.2026: jede Kopie startet ein Programm; ist die Zeit des Scans um, wird nicht mehr kopiert.
+test('Ordner-Scan: nach der Zeitgrenze wird nicht mehr kopiert, die Datei steht mit dem Grund offen', async () => {
+  const gross = 'D:\\p\\netz.json'
+  const d: Record<string, string> = { [gross]: `{"k": "${'a'.repeat(5_000_000)}"}\n` }
+  const o = ordnerUmgebung(() => leer, d)
+  o.u.write = async (p, text) => {
+    if (p.endsWith('netz.json')) throw new Error('write over 4 MiB rejects')
+    d[p] = text
+  }
+  const kopiert: string[] = []
+  o.u.kopieren = async von => {
+    kopiert.push(von)
+  }
+  let uhr = 0
+  o.u.jetzt = async () => (uhr++ === 0 ? 0 : 10 * 60000)
+  const e = await scannenOrdner(o.u, [gross], { restMs: 60000 })
+  expect(kopiert).toEqual([])
+  expect(e.get(gross)?.luecken).toContain('Kopie nicht anlegbar (Zeitgrenze des Scans erreicht)')
+})
+
+test('Spiegelziel: nur <Arbeitsordner>\\spiegel-<Kennung>\\<Nummer>\\<Name>, kein Weg hinaus', () => {
+  const a = 'C:\\Temp\\code-waechter'
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\spiegel-chat_1\\0\\netz.json')).toBe(true)
+  expect(spiegelZielOk(`${a}\\`, 'c:\\temp\\Code-Waechter\\spiegel-a-b\\12\\gr[o]ss $x.asset')).toBe(true)
+  // Weg hinaus über / und .., anderer Ordner, fehlende oder zusätzliche Teile, Name nur aus Punkten, leerer Arbeitsordner
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\spiegel-a\\0\\../../../../Users/x/.claude/settings.json')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\spiegel-a\\0\\..')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\x\\code-waechter\\spiegel-a\\0\\netz.json')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter-anders\\spiegel-a\\0\\netz.json')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\spiegel-a\\netz.json')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\spiegel-a\\0\\sub\\netz.json')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\anders\\0\\netz.json')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\spiegel-a\\x\\netz.json')).toBe(false)
+  expect(spiegelZielOk(a, 'C:\\Temp\\code-waechter\\spiegel-a\\0\\c:x.json')).toBe(false)
+  expect(spiegelZielOk('', '\\spiegel-a\\0\\netz.json')).toBe(false)
+})
+
+test('Kopieraufruf: fester PowerShell-Befehl, Pfade nur über Umgebungswerte; falsches Ziel oder Quelle ohne vollen Pfad startet nichts', () => {
+  const a = 'C:\\Temp\\code-waechter'
+  const gut = kopierAufruf(a, 'D:\\p\\gr[o]ss $x.json', `${a}\\spiegel-chat_1\\3\\gr[o]ss $x.json`)
+  expect(gut).toEqual({
+    argv: ['powershell', '-NoProfile', '-NonInteractive', '-Command', KOPIER_BEFEHL],
+    env: { CW_VON: 'D:\\p\\gr[o]ss $x.json', CW_NACH: `${a}\\spiegel-chat_1\\3\\gr[o]ss $x.json` },
+  })
+  // Der Befehl selbst enthält keinen Pfad; Quelle mit -LiteralPath, bei jedem Fehler Abbruch
+  expect(KOPIER_BEFEHL).not.toMatch(/[A-Za-z]:\\/)
+  expect(KOPIER_BEFEHL).toContain('$ErrorActionPreference = "Stop"')
+  expect(KOPIER_BEFEHL).toContain('Copy-Item -LiteralPath $env:CW_VON -Destination $env:CW_NACH')
+  expect(KOPIER_BEFEHL).toContain('Split-Path -LiteralPath $env:CW_NACH')
+  // Kopierte PowerShell still nichts (Gegenprobe mit -Path: Code 0 ohne Datei), endet der Befehl mit Code 3
+  expect(KOPIER_BEFEHL).toContain('if (-not (Test-Path -LiteralPath $env:CW_NACH -PathType Leaf)) { exit 3 }')
+  expect(kopierAufruf(a, 'netz.json', `${a}\\spiegel-chat_1\\0\\netz.json`)).toEqual({ fehler: 'Quelle ist kein voller Pfad' })
+  expect(kopierAufruf(a, 'C:netz.json', `${a}\\spiegel-chat_1\\0\\netz.json`)).toEqual({ fehler: 'Quelle ist kein voller Pfad' })
+  expect(kopierAufruf(a, 'D:\\p\\netz.json', 'C:\\Users\\x\\.claude\\settings.json')).toEqual({ fehler: 'Ziel liegt nicht im Spiegelordner' })
+  expect(kopierAufruf(a, 'D:\\p\\netz.json', `${a}\\spiegel-a\\0\\..\\..\\x.json`)).toEqual({ fehler: 'Ziel liegt nicht im Spiegelordner' })
+  expect('argv' in kopierAufruf(a, '\\\\server\\teil\\netz.json', `${a}\\spiegel-a\\0\\netz.json`)).toBe(true)
+})
+
+test('Zeilen zerlegen: zeilenVon gibt genau dasselbe wie split(/\\r?\\n/)', () => {
+  for (const s of ['', 'a', 'a\nb', 'a\r\nb', 'a\r\n', 'a\n', '\r\n', 'a\rb', 'a\r', 'a\r\r\nb', '\n\n', 'a\r\n\r\nb\r', 'Ä\r\nö\nü']) {
+    expect(zeilenVon(s)).toEqual(s.split(/\r?\n/))
+  }
 })
 
 test('L1 Ordner-Scan: fehlender, abstürzender oder zu langsamer Scanner steht bei jeder betroffenen Datei offen, nie still als geprüft', async () => {

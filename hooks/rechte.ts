@@ -202,6 +202,82 @@ function kommentarFrei(text: string, art: Art): string {
   return o.join('')
 }
 
+// Datendateien mit Fliesstext (28.11.2026, eine Wissens-Datei eintraege.json: ein Eintrag BESCHREIBT den Schalter, er schaltet
+// nichts). In einer .json/.jsonc-Datei zählt ein Fund nur dann nicht, wenn ALLES gilt:
+//   - er ist ein Schalter der Befehlszeile (der gefundene Text beginnt mit -), keine Einstellung mit Wert: bypassPermissions,
+//     allowDangerouslySkipPermissions: true, chat.tools.autoApprove ... bleiben überall rot, auch die VS-Code-Einstellung
+//     ...claudeAgent.allowDangerouslySkipPermissions, die unter "Claude Code" läuft (dritte Gegenprüfung 28.11.2026);
+//   - er steht im Wert eines Text-Schlüssels (textSchluessel: "such_text", "ganzer_text", "beschreibung" ...) - nie unter "args",
+//     "command", "scripts" oder in einem Listen-Eintrag. Ein Programm, das eine Einstellung ausführt, liest sie unter seinem
+//     eigenen Schlüsselnamen; den kann ein eingeschleuster Text nicht umbenennen;
+//   - die Zeichenkette ist ein mehrzeiliger Text: mindestens 200 Zeichen und ein echtes \n-Escape (ein maskierter Backslash vor n
+//     wie in "...\\npm\\claude.cmd" ist keins);
+//   - die Datei startet keine Befehle (RECHTE_DATEI und BEFEHLS_JSON).
+// Verworfen: Wörter und Programmnamen vor dem Schalter zählen (zweite Gegenprüfung 28.11.2026: Fortsetzungszeile "claude \" +
+// "--model x --dangerously-...", zerlegter Name cla''ude blieben still).
+// Nicht für JSON5: dort gibt es Zeichenketten in einfachen Anführungszeichen, die diese Erkennung nicht kennt.
+const JSON_DATEI = /\.jsonc?$/i
+const BEFEHLS_JSON = /(?:^|[\\/])(?:package|devcontainer|\.devcontainer|claude_desktop_config|launch|tasks|mcp|settings|keybindings|deno|composer|nx|project|turbo)\.jsonc?$/i
+// Der Schlüssel in Teilen (such_text, suchText, such-text, such.text): der letzte Teil ist ein Text-Wort, kein Teil ein Befehlswort.
+// Nie der blosse Schlüssel "text": VS Code tippt args.text von workbench.action.terminal.sendSequence ins Terminal (dritte
+// Gegenprüfung 28.11.2026), und andere Programme können "text" ebenso benutzen.
+const TEXT_WORT = new Set(['text', 'beschreibung', 'description', 'notiz', 'notizen', 'note', 'notes', 'zusammenfassung', 'summary', 'inhalt', 'hinweis', 'kommentar', 'comment', 'erklaerung', 'erklärung'])
+const BEFEHLS_WORT = new Set(['command', 'commands', 'cmd', 'befehl', 'befehle', 'script', 'scripts', 'skript', 'exec', 'run', 'shell', 'input', 'eingabe', 'sequence', 'prompt', 'args', 'arguments', 'argv'])
+export function textSchluessel(roh: string): boolean {
+  const teile = roh.replace(/([a-zäöüß])([A-ZÄÖÜ])/g, '$1 $2').toLowerCase().split(/[\s_.\-]+/).filter(x => x !== '')
+  return teile.length >= 2 || (teile.length === 1 && teile[0] !== 'text')
+    ? TEXT_WORT.has(teile[teile.length - 1] ?? '') && !teile.some(x => BEFEHLS_WORT.has(x))
+    : false
+}
+
+// Die Zeichenketten einer Zeile, je mit ihrem Platz (Anführungszeichen) und ob die Ausnahme für sie gilt. Einmal je Zeile in einem
+// Durchgang (sonst wüchse der Aufwand in einer langen, zusammengepressten JSON-Zeile mit Funde mal Zeilenlänge).
+type Wert = { von: number; bis: number; text: boolean }
+function textWerte(zeile: string): Wert[] {
+  const werte: Wert[] = []
+  let start = -1
+  let umbruch = false
+  let zeichen = 0 // Zeichen nach dem Auflösen der Escapes: \n, \" und   zählen je eins (vierte Gegenprüfung 28.11.2026)
+  let vorher: { bis: number; inhalt: string } | undefined // die Zeichenkette davor (ein Schlüssel, wenn nur : dazwischen steht)
+  for (let k = 0; k < zeile.length; k++) {
+    const c = zeile[k]
+    if (start === -1) {
+      if (c === '"') {
+        start = k
+        umbruch = false
+        zeichen = 0
+      }
+    } else if (c === '\\') {
+      const n = zeile[k + 1]
+      if (n === 'n') umbruch = true
+      k += n === 'u' && /^[0-9A-Fa-f]{4}$/.test(zeile.slice(k + 2, k + 6)) ? 5 : 1
+      zeichen++
+    } else if (c === '"') {
+      const istWert = vorher !== undefined && /^\s*:\s*$/.test(zeile.slice(vorher.bis + 1, start))
+      // Ein Schlüssel mit Escape zählt nie als Text-Schlüssel: "commandText" liest jeder JSON-Leser als commandText.
+      const schluessel = vorher?.inhalt ?? ''
+      werte.push({ von: start, bis: k, text: zeichen >= 200 && umbruch && istWert && !schluessel.includes('\\') && textSchluessel(schluessel) })
+      vorher = { bis: k, inhalt: zeile.slice(start + 1, k) }
+      start = -1
+    } else zeichen++
+  }
+  return werte
+}
+
+// Gilt die Ausnahme an der Stelle at (in einer Zeichenkette, nicht auf einem Anführungszeichen)?
+function imTextWert(werte: Wert[], at: number): boolean {
+  let lo = 0
+  let hi = werte.length - 1
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1
+    const w = werte[m] as Wert
+    if (at <= w.von) hi = m - 1
+    else if (at >= w.bis) lo = m + 1
+    else return w.text
+  }
+  return false
+}
+
 export function rechteAbschalter(text: string, file: string): SFund[] {
   const funde: SFund[] = []
   const roh = text.split(/\r?\n/)
@@ -227,8 +303,21 @@ export function rechteAbschalter(text: string, file: string): SFund[] {
     return lo + 1
   }
   const zeilen = new Set<number>()
+  const json = JSON_DATEI.test(file) && !RECHTE_DATEI.test(file) && !BEFEHLS_JSON.test(file)
+  const werteJe = new Map<number, Wert[]>()
+  const werteVon = (nr: number): Wert[] => {
+    let w = werteJe.get(nr)
+    if (w === undefined) {
+      w = textWerte(frei.slice(anfang[nr - 1] ?? 0, anfang[nr] ?? frei.length))
+      werteJe.set(nr, w)
+    }
+    return w
+  }
   const melden = (at: number, wer: string, gefunden: string) => {
     const nr = zeileBei(at)
+    // Schalter im Fliesstext einer Datendatei (oben): vor der Markierung geprüft, damit eine lange Zeile mit vielen solchen Stellen
+    // nicht je Stelle neu durchsucht wird.
+    if (json && /^-/.test(gefunden) && imTextWert(werteVon(nr), at - (anfang[nr - 1] ?? 0))) return
     if (zeilen.has(nr) || OK_SICHER.test(roh[nr - 1] ?? '')) return
     zeilen.add(nr)
     const was = daten(gefunden.replace(/["'`]/g, '').replace(/\s+/g, ' ').trim(), 80)

@@ -9,7 +9,7 @@ import { gameChecks } from './spiele'
 import { windowsChecks } from './windows'
 import { HARD_CODE, hardeningChecks, type HardFinding } from './haertung'
 import { clearExeCache, isAbsolute, resolveExe } from './prozess'
-import { berichtBlock, berichtNeu, berichtScanBlock, scannen, scannenOrdner } from './sicherheit'
+import { berichtBlock, berichtNeu, berichtScanBlock, kopierAufruf, scannen, scannenOrdner } from './sicherheit'
 import type { Ergebnis, Umgebung } from './sicherheit'
 import { TEXT_DATEI, textBefunde, zusatzBefunde } from './zusatz'
 import { istPaketDatei, neuePakete, paketePruefen } from './pakete'
@@ -4830,10 +4830,25 @@ async function clearDisplay($: any): Promise<string> {
   await update($, logAtom, () => [])
   openErrors.clear()
   lastReminder = undefined
+  const haengend = await laufanzeigeAufraeumen($)
   return t(
     `Code-Wächter: Anzeige geleert (${before} Einträge entfernt). Die Fehlerberichte der Scans bleiben als Dateien erhalten.`,
     `Code Guard: display cleared (${before} entries removed). The scan reports stay as files.`,
-  )
+  ) + (haengend > 0 ? t(` Dazu ${haengend} hängende Laufanzeige entfernt.`, ` Also removed ${haengend} stuck progress entry.`) : '')
+}
+
+// Die Laufanzeige (runningAtom) liegt im Sitzungszustand und überlebt ein Neuladen der Mod (/reload-plugins), die laufenden
+// Prüfungen nicht: ein Scan, den das Neuladen abbrach, räumte seinen Eintrag nie weg - oben stand dann für immer "Scan <Projekt>"
+// (28.11.2026). Läuft in diesem Wächter nichts (active 0), ist jeder Eintrag ein Rest.
+async function laufanzeigeAufraeumen($: any): Promise<number> {
+  if ((await read($, runningAtom)).length === 0) return 0
+  let reste = 0
+  // active erst im Schreibschritt prüfen: startet zwischen Lesen und Schreiben eine Prüfung, bleibt ihr Eintrag stehen.
+  await update($, runningAtom, l => {
+    reste = active > 0 ? 0 : l.length
+    return active > 0 ? l : []
+  })
+  return reste
 }
 
 // ---- Selbstmeldung: Endet eine Antwort und stehen in der
@@ -4968,6 +4983,14 @@ const scannerUmgebung = ($: any, kennung: string): Umgebung => ({
       env: { CW_DIR: dir },
       timeoutMs: 120000,
     })
+  },
+  // Dateien über 4 MiB ($.fs.write lehnt sie ab): unverändert kopieren, nur in den Spiegelordner des Ordner-Scans
+  // (kopierAufruf prüft Ziel und Quelle; sonst startet nichts).
+  kopieren: async (von, nach, fristMs) => {
+    const a = kopierAufruf(await workDir($), von, nach)
+    if ('fehler' in a) throw new Error(a.fehler)
+    const r = await sh($, a.argv, { env: a.env, timeoutMs: Math.max(1, Math.floor(fristMs)) })
+    if (!r.ok || r.exitCode !== 0) throw new Error(r.ok ? clip(r.stderr || `Code ${r.exitCode}`, 120) : r.reason)
   },
   jetzt: () => $.clock.now(),
   cAnalyse: () => cWerkzeuge($),
@@ -5120,8 +5143,10 @@ async function runCheck($: any, file: string, kinds: Kind[], alt?: string): Prom
       // Datei inzwischen weg: dann merkt sich die Mod nichts.
     }
   } finally {
-    active--
+    // Erst den eigenen Eintrag aus der Laufanzeige nehmen, dann als beendet zählen: sonst hielte laufanzeigeAufraeumen ihn in der
+    // Zwischenzeit für einen Rest (fünfte Gegenprüfung 28.11.2026).
     await safe(update($, runningAtom, l => l.filter(x => x.id !== id)))
+    active--
     const hints = outcome.status === 'ok' ? (outcome.hints?.length ?? 0) : 0
     await addToLog(
       $,
@@ -5516,6 +5541,9 @@ function countText(c: ScanCount): string {
 }
 
 const MAX_FILES = 3000
+// Text- und Regeldateien (.md, .txt) haben eine eigene, höhere Grenze: in einem grossen Projektordner liegen 5812 (gezählt 28.11.2026), bei 3000
+// blieben die übrigen ungeprüft. Die Zeitgrenze des Scans (SCAN_MAX_MS) gilt für sie weiter.
+const MAX_TEXTE = 20000
 const MAX_DIRS = 2000
 const MAX_REPORTED = 200
 const SCAN_MAX_MS = 30 * 60 * 1000
@@ -5582,7 +5610,7 @@ async function readProjects($: any): Promise<{ list: ScanTarget[]; file: string 
 // (auch der Startordner, wenn es ihn nicht gibt). links: Verknüpfungen (Junctions, Symlinks), denen der Scan nicht folgt; sie
 // können aus dem Ziel hinaus oder im Kreis führen.
 // texts: Text- und Regeldateien ohne eigene Prüfung (.md, .txt; TEXT_DATEI), für die unsichtbaren Zeichen der Stufe 1. Sie haben eine
-// eigene Obergrenze (MAX_FILES) und verdrängen nie eine Code-Datei; textsCut: es gab mehr (Gegenprüfung 28.11.2026).
+// eigene Obergrenze (MAX_TEXTE) und verdrängen nie eine Code-Datei; textsCut: es gab mehr (Gegenprüfung 28.11.2026).
 type FileList = { files: string[]; texts: string[]; textsCut: boolean; truncated: boolean; limit?: 'dirs' | 'files'; omitted: string[]; unreadable: string[]; links: string[] }
 
 async function listFiles($: any, root: string): Promise<FileList> {
@@ -5624,7 +5652,7 @@ async function listFiles($: any, root: string): Promise<FileList> {
         if (files.length >= MAX_FILES) return { files, texts, textsCut, truncated: true, limit: 'files', omitted, unreadable, links }
       } else if (x.kind === 'file' && TEXT_DATEI.test(x.name) && !SKIP.test(p)) {
         // Eigene Obergrenze: die Code-Dateien zählen weiter wie vor dem 28.11.2026, Text- und Regeldateien drängen keine weg
-        if (texts.length < MAX_FILES) texts.push(p)
+        if (texts.length < MAX_TEXTE) texts.push(p)
         else textsCut = true
       }
     }
@@ -6065,8 +6093,8 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
     if (textsCut) {
       skipped.push({
         file: target.dir,
-        reason: t(`mehr als ${MAX_FILES} Text- und Regeldateien (.md, .txt): die weiteren sind nicht auf unsichtbare Zeichen geprüft`,
-          `more than ${MAX_FILES} text and rule files (.md, .txt): the others were not checked for invisible characters`),
+        reason: t(`mehr als ${MAX_TEXTE} Text- und Regeldateien (.md, .txt): die weiteren sind nicht auf unsichtbare Zeichen geprüft`,
+          `more than ${MAX_TEXTE} text and rule files (.md, .txt): the others were not checked for invisible characters`),
       })
     }
     const seconds = ((await $.clock.now()) - t0) / 1000
@@ -6203,9 +6231,10 @@ async function scanTarget($: any, target: ScanTarget, deadline: number): Promise
   } catch (err) {
     return withDataNote([t(`Code-Wächter Scan ${daten(target.name, 80)}: abgebrochen – `, `Code Guard scan ${daten(target.name, 80)}: aborted – `) + clip(String((err as { message?: string })?.message ?? err), 160)])
   } finally {
+    // Erst aus der Laufanzeige, dann als beendet zählen (siehe laufanzeigeAufraeumen)
+    await safe(update($, runningAtom, l => l.filter(x => x.id !== id)))
     active--
     releaseLargeText()
-    await safe(update($, runningAtom, l => l.filter(x => x.id !== id)))
   }
 }
 
@@ -6445,10 +6474,11 @@ async function toolsCommand($: any, args: string): Promise<string> {
     } catch (err) {
       lines.push(t('✖ abgebrochen: ', '✖ aborted: ') + clip(String((err as { message?: string })?.message ?? err), 160))
     } finally {
+      // Erst aus der Laufanzeige, dann als beendet zählen (siehe laufanzeigeAufraeumen)
+      await safe(update($, runningAtom, l => l.filter(x => x.id !== id)))
       active--
       releaseLargeText()
       installing = false
-      await safe(update($, runningAtom, l => l.filter(x => x.id !== id)))
       const text = `${t('Code-Wächter Prüfprogramme', 'Code Guard checkers')}:\n${lines.join('\n')}`
       pushPending({ sid, text })
       await safe(Promise.resolve($.ui.toast(clip(lines.join(' '), 220), { timeoutMs: 15000 })))
@@ -6559,6 +6589,8 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await detectLanguage($)
+    // Nach einem Neuladen läuft hier noch nichts: Reste der Laufanzeige weg (siehe laufanzeigeAufraeumen).
+    await safe(laufanzeigeAufraeumen($))
     await $.command.register({ name: 'waechter', description: t('Öffnet die Seitenleiste des Code-Wächters', 'Opens the Code Guard sidebar') })
     await $.command.register({
       name: 'scan',

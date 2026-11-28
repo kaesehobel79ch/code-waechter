@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import { setLang } from './i18n'
 import { rechteAbschalter } from './rechte'
+import { textSchluessel } from './rechte'
 
 // Erwartungen aus dem Auftrag vom 27.11.2026 (Regel "KI-Agent schaltet seine eigenen Rückfragen ab") und den Anleitungen der
 // Hersteller (Namen siehe Kopf von rechte.ts). Diese Datei ist eine Prüfdatei: die Schalter stehen hier absichtlich im Klartext.
@@ -170,4 +171,84 @@ test('Zeile, Spalte und Text der Meldung; ein Fund je Zeile', () => {
   } finally {
     setLang('de')
   }
+})
+
+// Scan 28.11.2026, eine Wissens-Datei (eintraege.json): ein Eintrag BESCHREIBT den Schalter, er schaltet nichts.
+// Ausnahme nur für einen Schalter der Befehlszeile im mehrzeiligen Wert eines Text-Schlüssels (Vorgabe nach der dritten
+// Gegenprüfung vom 28.11.2026).
+test('JSON: Schalter im mehrzeiligen Wert eines Text-Schlüssels bleibt still (Wissens-Datei)', () => {
+  const lang = 'Hinweis bei Änderungen. '.repeat(10)
+  const prosa = `Bauplan: #H Stufe 1\\n- 2. Rechte-Abschalter rot: Code oder Einstellungen mit --dangerously-skip-permissions, --yolo, autoApprove; ${lang}`
+  expect(art(`[\n  {\n    "such_text": "${prosa}",\n    "ganzer_text": "${prosa}"\n  }\n]\n`, 'D:\\g\\eintraege.json')).toEqual([])
+  // Jedes Text-Wort als letzter Teil des Schlüssels, in jeder Schreibweise
+  for (const s of ['such_text', 'suchText', 'such-text', 'such.text', 'beschreibung', 'description', 'notiz', 'notizen', 'note', 'notes',
+    'zusammenfassung', 'summary', 'inhalt', 'hinweis', 'kommentar', 'comment', 'erklaerung', 'erklärung', 'kurz_beschreibung']) {
+    expect(art(`{ "${s}": "${prosa}" }`, 'D:\\g\\daten.json')).toEqual([])
+  }
+  // Auch in .jsonc, verschachtelt und mit Kommentar zwischen Schlüssel und Wert
+  expect(art(`{ "a": { "notiz": /* x */ "${prosa}" } }`, 'D:\\g\\daten.jsonc')).toEqual([])
+  // Auch ein Befehl im Text bleibt still: kein Programm führt den Wert eines solchen Schlüssels aus
+  expect(art(`{ "notiz": "${lang}\\nclaude --dangerously-skip-permissions -p x" }`, 'D:\\g\\daten.json')).toEqual([])
+})
+
+test('JSON: Text-Schlüssel - letzter Teil ein Text-Wort, kein Befehlswort, nie der blosse Schlüssel "text"', () => {
+  for (const s of ['such_text', 'ganzer_text', 'suchText', 'beschreibung', 'Description', 'kurz_notiz', 'erklärung']) expect(textSchluessel(s)).toBe(true)
+  for (const s of ['text', 'Text', 'commandText', 'scriptText', 'shell_text', 'promptText', 'args_text', 'run.text', 'context', 'textbefehl', 'args',
+    'command', 'texte', '', 'text_befehl']) expect(textSchluessel(s)).toBe(false)
+})
+
+// Jede Bedingung der Ausnahme entscheidet einzeln: der rote Fall erfüllt jeweils alle anderen. Dazu die Befehle der drei
+// Gegenprüfungen vom 28.11.2026.
+test('JSON: ohne Text-Schlüssel, Befehlszeilen-Schalter, echten Umbruch, 200 Zeichen, in Befehlsdateien und JSON5 bleibt es rot', () => {
+  const lang = 'Hinweis bei Änderungen. '.repeat(10)
+  const prosa = `${lang}\\n- 2. Rechte-Abschalter rot: Code oder Einstellungen mit --dangerously-skip-permissions, ${lang}`
+  // Schlüssel: kein Text-Schlüssel, der blosse Schlüssel text, Listen-Eintrag, Text-Schlüssel erst nach der Zeichenkette
+  for (const s of ['args', 'command', 'cmd', 'befehl', 'run', 'postCreateCommand', 'x', 'text', 'commandText']) {
+    expect(art(`{ "${s}": "${prosa}" }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  }
+  expect(art(`{ "such_text": ["${prosa}"] }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`{ "args": ["-c", "${prosa}"], "such_text": "kurz" }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`{ "such_text":\n  "${prosa}" }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@2'])
+  // VS Code keybindings.json: args.text von sendSequence wird ins Terminal getippt
+  expect(art(`[{ "key": "f9", "command": "workbench.action.terminal.sendSequence", "args": { "text": "${lang}\\nclaude --dangerously-skip-permissions\\n" } }]`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`[{ "args": { "such_text": "${prosa}" } }]`, 'D:\\p\\.vscode\\keybindings.json')).toEqual(['RECHTE-AUS!@1'])
+  // Fortsetzungszeile aus der zweiten Gegenprüfung (claude \ und auf der nächsten Zeile der Schalter) unter args
+  expect(art(`{ "args": ["-c", "${lang}\\nclaude \\\\\\n  --model sonnet --verbose --dangerously-skip-permissions -p x"] }`, 'D:\\p\\b.json')).toEqual(['RECHTE-AUS!@1'])
+  // Einstellungen mit Wert bleiben auch im Text rot (dritte Gegenprüfung: VS-Code-Einstellung unter "Claude Code")
+  expect(art(`{ "such_text": "${lang}\\nIn den Einstellungen 'github.copilot.chat.claudeAgent.allowDangerouslySkipPermissions': true setzen" }`, 'D:\\p\\e.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`{ "such_text": "${lang}\\nDiese Zeile in den Einstellungen 'chat.tools.autoApprove': true gibt alles frei" }`, 'D:\\p\\e.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`{ "such_text": "${lang}\\nmit permission_mode='bypassPermissions' im Agenten" }`, 'D:\\p\\e.json')).toEqual(['RECHTE-AUS!@1'])
+  // Umbruch: nur ein maskierter Backslash vor n (C:\\npm), kein echtes \n
+  expect(art(`{ "such_text": "${lang} --dangerously-skip-permissions C:\\\\npm\\\\x" }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  // Länge: 199 Zeichen rot, 200 Zeichen still - gezählt nach dem Auflösen der Escapes (\n ist ein Zeichen)
+  const mit = (n: number) => { const kopf = 'Zeile 1\\nmit --dangerously-skip-permissions '; return `{ "such_text": "${kopf}${'x'.repeat(n - (kopf.length - 1))}" }` }
+  expect(art(mit(199), 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(mit(200), 'D:\\p\\a.json')).toEqual([])
+  // Vierte Gegenprüfung: Escapes im Schlüssel (\u0063ommandText = commandText) und Auffüllen mit \u0020 zählen nicht
+  expect(art(`{ "\\u0063ommandText": "${prosa}" }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`{ "such\\u005ftext": "${prosa}" }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`{ "such_text": "Zeile 1\\nmit --dangerously-skip-permissions ${'\\u0020'.repeat(60)}" }`, 'D:\\p\\a.json')).toEqual(['RECHTE-AUS!@1'])
+  // Dateien, die Befehle starten oder Rechte festlegen
+  for (const datei of ['D:\\p\\package.json', 'D:\\p\\.devcontainer\\devcontainer.json', 'D:\\p\\.devcontainer.json', 'D:\\p\\claude_desktop_config.json',
+    'D:\\p\\.vscode\\launch.json', 'D:\\p\\.vscode\\mcp.json', 'D:\\p\\tasks.json', 'D:\\p\\keybindings.json', 'D:\\p\\settings.json', 'D:\\p\\project.json',
+    'D:\\p\\deno.json', 'D:\\p\\deno.jsonc', 'D:\\p\\composer.json', 'D:\\p\\nx.json', 'D:\\p\\turbo.json']) {
+    expect(art(`{ "such_text": "${prosa}" }`, datei)).toEqual(['RECHTE-AUS!@1'])
+  }
+  expect(art(`{ "such_text": "${prosa}" }`, 'D:\\p\\.claude\\settings.json')).toEqual(['RECHTE-DATEI@1', 'RECHTE-AUS!@1'])
+  // Die Rechte-Dateien, die nicht schon als Befehlsdatei gelten
+  for (const datei of ['D:\\p\\.mcp.json', 'D:\\p\\.claude.json', 'D:\\p\\.claude\\settings.local.json', 'D:\\p\\hooks\\hooks.json', 'D:\\p\\.cursor\\mcp.json']) {
+    expect(art(`{ "such_text": "${prosa}" }`, datei)).toEqual(['RECHTE-DATEI@1', 'RECHTE-AUS!@1'])
+  }
+  // JSON5 (Zeichenketten in einfachen Anführungszeichen): keine Ausnahme
+  expect(art(`{ such_text: '${lang}\\nmit --dangerously-skip-permissions' }`, 'D:\\p\\x.json5')).toEqual(['RECHTE-AUS!@1'])
+  expect(art(`{ "such_text": "${prosa}" }`, 'D:\\p\\x.json5')).toEqual(['RECHTE-AUS!@1'])
+  // Schalter ausserhalb der Zeichenkette mit Text auf derselben Zeile; Befehle wie bisher
+  expect(art(`{ "such_text": "${prosa}", "args": ["--dangerously-skip-permissions"] }`, 'D:\\p\\c.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art('{ "scripts": { "ki": "claude --dangerously-skip-permissions -p x" } }', 'D:\\p\\aufgaben.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(art('{ "befehl": "echo a\\nclaude --dangerously-skip-permissions" }', 'D:\\p\\b.json')).toEqual(['RECHTE-AUS!@1'])
+  // Lange zusammengepresste Zeile mit vielen Funden: jeder Fund in einem Text-Wert still, der eine Befehl rot, in kurzer Zeit
+  const viele = `[${Array.from({ length: 1000 }, () => `{"such_text":"${prosa}"}`).join(',')},{"args":["--dangerously-skip-permissions"]}]`
+  const t0 = Date.now()
+  expect(art(viele, 'D:\\p\\gross.json')).toEqual(['RECHTE-AUS!@1'])
+  expect(Date.now() - t0).toBeLessThan(3000)
 })

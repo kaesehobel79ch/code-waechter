@@ -55,6 +55,10 @@ export type Umgebung = {
   kennung: string
   // Nur für den Ordner-Scan (scannenOrdner): einen Hilfsordner samt Inhalt löschen, und die Uhr für die Zeitgrenze.
   leeren?: (dir: string) => Promise<void>
+  // Nur für den Ordner-Scan: eine Datei unverändert in den Spiegel kopieren, wenn write sie nicht schreiben kann ($.fs.write
+  // lehnt laut Schnittstelle alles über 4 MiB ab; gemessen 28.11.2026: 37 Dateien ab 4,79 MB blieben ungeprüft).
+  // fristMs: höchstens so lange darf die Kopie dauern (Rest der Zeitgrenze des Scans, höchstens 120 s).
+  kopieren?: (von: string, nach: string, fristMs: number) => Promise<void>
   jetzt?: () => Promise<number>
   // C/C++-Analyse (c_analyse.ts): cl.exe mit seinen Kopfdatei-Ordnern und clang-tidy, je mit vollem Pfad (fehlt eins: offene Lücke).
   // Ohne dieses Feld gehört die Analyse nicht zur Umgebung; die Mod (scannerUmgebung in register.tsx) gibt es immer an.
@@ -127,10 +131,15 @@ export function devskimLesen(stdout: string): { funde: SFund[]; fehler?: string 
 
 // DS126858 (schwacher Hash) sucht MD2/MD4/MD5 ohne Wortgrenze: "fremd2" ist kein Hash. Steht vor der Fundstelle ein Buchstabe, eine
 // Ziffer oder _, ist es ein Name, kein Fund.
+// DS106863 (Verfahren DES) trifft auch das deutsche Wort "des" in Grossbuchstaben (28.11.2026, ein Prüfprogramm:
+// "// GEAENDERT AM ABEND DES 23.09.2026"). Eine Zeile, die mit // beginnt, ist in C#, C und C++ (nur dort läuft DevSkim) ganz
+// Kommentar und benutzt kein Verfahren. Nur diese: # ist dort eine Präprozessor-Zeile (#define VERFAHREN "DES"), und eine Zeile
+// mit * oder /* am Anfang kann Code sein (*verfahren = "DES"; /* alt */ DES.Create()) - Gegenprüfung 28.11.2026.
 export function devskimImWort(f: SFund, zeilen: string[]): boolean {
+  const zeile = zeilen[f.line - 1] ?? ''
+  if (f.code === 'DS106863') return /^\s*\/\//.test(zeile)
   if (f.code !== 'DS126858') return false
-  const vor = (zeilen[f.line - 1] ?? '').charAt(f.col - 2)
-  return /[A-Za-z0-9_]/.test(vor)
+  return /[A-Za-z0-9_]/.test(zeile.charAt(f.col - 2))
 }
 
 // ---- Cppcheck: eigenes Format über --template, Felder mit | getrennt (Windows-Pfade enthalten kein |); {inconclusive:U} schreibt U
@@ -1034,7 +1043,7 @@ export async function scannen(u: Umgebung, file: string, text: string | undefine
     job().catch((err: unknown) => {
       kaputt(name, String((err as { message?: string })?.message ?? err))
     })
-  const zeilen = (text ?? '').split(/\r?\n/)
+  const zeilen = zeilenVon(text ?? '')
 
   const jobs: Promise<void>[] = []
   if (wahl.muster && text !== undefined) {
@@ -1150,9 +1159,60 @@ export async function scannen(u: Umgebung, file: string, text: string | undefine
 // DevSkim, Bandit (-r, kennt .py und .pyw) und Gitleaks laufen; die Funde kommen über die Nummer zur echten Datei zurück. Cppcheck läuft
 // auf den echten Dateien (eingebundene Kopfdateien liegen dort) über --file-list, Kopfdateien als C++ in einem eigenen Lauf. Alle vier
 // schreiben in eine Datei (-O, --output-file, -o, --report-path), damit viele Funde nie abgeschnitten werden. Der Spiegel enthält den
-// Text so, wie der Wächter ihn liest (UTF-8), mit denselben Zeilen.
+// Text so, wie der Wächter ihn liest (UTF-8), mit denselben Zeilen; eine Datei über 4 MiB liegt dort Byte für Byte (u.kopieren).
 // Fehlt ein Scanner, bricht er ab oder reicht die Zeit nicht, steht das bei jeder betroffenen Datei unter luecken - nie still.
 const SPIEGEL_NR = /[\\/]spiegel-[^\\/]+[\\/](\d+)[\\/][^\\/]+$/i
+
+// Ziel einer Kopie in den Spiegel (u.kopieren, Gegenprüfung 28.11.2026): genau <Arbeitsordner>\spiegel-<Kennung>\<Nummer>\<Name>,
+// der Name ohne \ / : * ? " < > | und nicht nur aus Punkten - so führt kein Ziel aus dem Spiegel hinaus.
+export function spiegelZielOk(arbeitsordner: string, ziel: string): boolean {
+  const a = arbeitsordner.replace(/[\\/]+$/, '')
+  if (a === '' || !ziel.toLowerCase().startsWith(`${a.toLowerCase()}\\`)) return false
+  const [ordner, nr, name, ...mehr] = ziel.slice(a.length + 1).split('\\')
+  return mehr.length === 0 && /^spiegel-[\w-]+$/i.test(ordner ?? '') && /^\d+$/.test(nr ?? '') && /^[^\\/:*?"<>|]+$/.test(name ?? '') && !/^\.+$/.test(name ?? '')
+}
+
+// Aufruf für u.kopieren (register.tsx): PowerShell mit festem Befehl, die Pfade nur über Umgebungswerte - ein Name mit $ [ ] `
+// wird so nie ausgewertet. Liegt das Ziel nicht im Spiegel oder ist die Quelle kein voller Pfad, wird nichts gestartet.
+// Echt geprüft mit einer 5-MB-Datei "gr[o]ss $x `y.json" (eigene Probe, 28.11.2026). Am Schluss sieht der Befehl nach,
+// ob die Kopie da ist (Code 3 sonst): die Gegenprobe mit -Path statt -LiteralPath meldete Code 0 und kopierte nichts.
+export const KOPIER_BEFEHL =
+  '$ErrorActionPreference = "Stop"; New-Item -ItemType Directory -Force -Path (Split-Path -LiteralPath $env:CW_NACH) | Out-Null; Copy-Item -LiteralPath $env:CW_VON -Destination $env:CW_NACH -Force; if (-not (Test-Path -LiteralPath $env:CW_NACH -PathType Leaf)) { exit 3 }'
+export function kopierAufruf(arbeitsordner: string, von: string, nach: string): { argv: string[]; env: Record<string, string> } | { fehler: string } {
+  if (!/^(?:[A-Za-z]:\\|\\\\)/.test(von)) return { fehler: t('Quelle ist kein voller Pfad', 'source is not a full path') }
+  if (!spiegelZielOk(arbeitsordner, nach)) return { fehler: t('Ziel liegt nicht im Spiegelordner', 'target is not in the mirror folder') }
+  return { argv: ['powershell', '-NoProfile', '-NonInteractive', '-Command', KOPIER_BEFEHL], env: { CW_VON: von, CW_NACH: nach } }
+}
+
+// Ab dieser Grösse (UTF-8-Bytes) kopiert der Ordner-Scan eine Datei, wenn $.fs.write sie ablehnt. Die Schnittstelle nennt 4 MiB
+// ("a write over 4 MiB rejects"); 3 MiB lässt Platz, falls die Grenze anders gezählt wird. Darunter bleibt ein Schreibfehler ein Fehler.
+export const KOPIER_AB = 3 * 1024 * 1024
+
+// Länge eines Textes in UTF-8-Bytes, ohne TextEncoder (ein Ersatzzeichen-Paar zählt 4, ein einzelnes Ersatzzeichen 3 wie U+FFFD).
+export function utf8Laenge(s: string): number {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c < 0x80) n += 1
+    else if (c < 0x800) n += 2
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      n += 4
+      i++
+    } else n += 3
+  }
+  return n
+}
+
+// Zeilen eines Textes wie text.split(/\r?\n/), aber ohne regulären Ausdruck: der ist in der Laufzeit des Wächters langsam
+// (gemessen 28.11.2026 an einem Sammelbericht von 117 KB, 1000-mal: mit /\r?\n/ 5109 ms, mit '\n' 43 ms).
+export function zeilenVon(text: string): string[] {
+  const z = text.split('\n')
+  for (let i = 0; i < z.length - 1; i++) {
+    const s = z[i] ?? ''
+    if (s.endsWith('\r')) z[i] = s.slice(0, -1)
+  }
+  return z
+}
 export const PROZESS_MAX_MS = 600000
 const DEVSKIM_GLOBS = '**/*.cs,**/*.c,**/*.cc,**/*.cpp,**/*.cxx,**/*.h,**/*.hpp,**/*.hxx'
 export const KOPF = /\.(?:h|hpp|hxx)$/i
@@ -1190,14 +1250,17 @@ export async function scannenOrdner(
   const paketTexte = new Map<string, string>() // für den OSV-Scanner (Zeile des Pakets)
   const semgrepTexte = new Map<string, string>() // für Semgrep (Markierung code-waechter:ok SICHERHEIT in der Zeile)
   const spiegelPfad = new Map<string, string>() // echte Datei -> ihre Kopie im Spiegel (Semgrep prüft die Kopie, siehe semgrep.ts)
+  // nummer hat Lücken: eine gescheiterte Kopie verbraucht ihre Nummer (unten), ihr Platz bleibt leer.
   const luecke = (liste: string[], text: string) => {
-    for (const f of liste) von(f).luecken.push(text)
+    for (const f of liste) if (f !== undefined) von(f).luecken.push(text)
   }
   const fehlt = (liste: string[], name: string, befehl: string) => luecke(liste, t(`${name} fehlt (einmalig: ${befehl})`, `${name} missing (once: ${befehl})`))
   const kaputt = (liste: string[], name: string, grund: string) => luecke(liste, t(`${name} lief nicht: ${rein(grund, 200)}`, `${name} did not run: ${rein(grund, 200)}`))
   const lief = (liste: string[], name: string) => {
-    for (const f of liste) von(f).liefen.push(name)
+    for (const f of liste) if (f !== undefined) von(f).liefen.push(name)
   }
+  const meldung = (x: unknown): string => String((x as { message?: string })?.message ?? x)
+  let naechsteNr = 0
   const ausgabe = async (pfad: string): Promise<string | undefined> => {
     const x = await u.read(pfad)
     return x === undefined || x.trim() === GITLEAKS_VORHER ? undefined : x
@@ -1220,13 +1283,33 @@ export async function scannenOrdner(
       if (OSV_DATEI.test(f)) paketTexte.set(f, text)
       if (SEMGREP_DATEI.test(f)) semgrepTexte.set(f, text)
       try {
-        const kopie = `${spiegel}\\${nummer.length}\\${nameMitKleinerEndung(f)}`
-        await u.write(kopie, text)
-        nummer.push(f)
+        // Jeder Versuch bekommt eine eigene Nummer, auch ein gescheiterter: sonst läge eine halbe Kopie im Ordner der nächsten Datei,
+        // und deren Funde gingen an die falsche Datei (vierte Gegenprüfung 28.11.2026).
+        const nr = naechsteNr++
+        const kopie = `${spiegel}\\${nr}\\${nameMitKleinerEndung(f)}`
+        try {
+          await u.write(kopie, text)
+        } catch (err) {
+          // Zu gross für write ($.fs.write lehnt über 4 MiB ab): die Datei selbst kopieren. Jeder andere Schreibfehler bleibt, wie er
+          // ist - sonst startete z. B. bei voller Platte jede Datei ein Programm. Ist die Zeit des Scans um, wird nicht mehr kopiert;
+          // scheitert das Kopieren, nennt die Lücke beide Gründe.
+          if (!u.kopieren || utf8Laenge(text) <= KOPIER_AB) throw err
+          const bleibt = await frist()
+          if (bleibt <= 0) throw new Error(t('Zeitgrenze des Scans erreicht', 'scan time limit reached'))
+          try {
+            await u.kopieren(f, kopie, Math.min(120000, bleibt))
+          } catch (k) {
+            throw new Error(`${meldung(err)}; ${t('Kopieren', 'copy')}: ${meldung(k)}`)
+          }
+        }
+        nummer[nr] = f
         spiegelPfad.set(f, kopie)
-        if (scannerFuer(f).devskim) zeilen.set(f, text.split(/\r?\n/))
+        if (scannerFuer(f).devskim) zeilen.set(f, zeilenVon(text))
       } catch (err) {
-        e.luecken.push(t(`Sicherheits-Scanner: Kopie nicht anlegbar (${rein(String((err as { message?: string })?.message ?? err), 120)})`, `security scanners: copy not possible (${rein(String((err as { message?: string })?.message ?? err), 120)})`))
+        // 300 Zeichen: der Kopiergrund ist höchstens 160 Zeichen lang (Fehlertext von PowerShell auf 120, Startfehler auf 160
+        // gekürzt) und hat neben einem üblichen Schreibgrund Platz; nur ein sehr langer Schreibgrund kürzt das Ende (sechste
+        // Gegenprüfung 28.11.2026).
+        e.luecken.push(t(`Kopie nicht anlegbar (${rein(meldung(err), 300)})`, `copy not possible (${rein(meldung(err), 300)})`))
       }
     }
     const zuDatei = (pfad: string): string | undefined => {
@@ -1254,7 +1337,7 @@ export async function scannenOrdner(
         else if (/\bERR\]/.test(`${r.stdout}${r.stderr}`)) kaputt(ds, 'DevSkim', daten(`${r.stderr}${r.stdout}`))
         else if (r.exitCode !== 0 || inhalt === undefined) kaputt(ds, 'DevSkim', inhalt === undefined ? t('keine Ausgabe geschrieben', 'no output written') : t(`Code ${r.exitCode}: `, `code ${r.exitCode}: `) + daten(`${r.stderr}${r.stdout}`))
         else {
-          for (const z of inhalt.split(/\r?\n/)) {
+          for (const z of zeilenVon(inhalt)) {
             const m = /^(.*)\|(\d+)\|(\d+)\|(Critical|Important|Moderate|BestPractice|ManualReview)\|(DS\d+)\|(.*)$/.exec(z.trim())
             const f = m ? zuDatei(m[1] ?? '') : undefined
             if (!m || !f || !scannerFuer(f).devskim) continue
@@ -1465,7 +1548,7 @@ export function berichtBlock(zeit: string, file: string, e: Ergebnis): string[] 
 
 export function berichtNeu(alt: string | undefined, block: string[]): string {
   const kopf = t(BERICHT_KOPF_DE, BERICHT_KOPF_EN)
-  const vorher = alt === undefined ? [] : alt.split(/\r?\n/)
+  const vorher = alt === undefined ? [] : zeilenVon(alt)
   // Kopf (in welcher Sprache auch immer) und die Leerzeile danach nur einmal.
   const rest = vorher[0] === BERICHT_KOPF_DE || vorher[0] === BERICHT_KOPF_EN ? vorher.slice(vorher[1] === '' ? 2 : 1) : vorher
   return [kopf, '', ...block, ...rest].slice(0, BERICHT_ZEILEN).join('\r\n')

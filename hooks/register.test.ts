@@ -6090,6 +6090,158 @@ test('Stufe 1: /scan prüft auch Text- und Regeldateien (.md, .txt) auf unsichtb
   expect([...bericht].some(c => (c.codePointAt(0) ?? 0) >= 0xe0000 && (c.codePointAt(0) ?? 0) <= 0xe007f)).toBe(false)
 })
 
+// Scan 28.11.2026: ein grosser Projektordner hat 5812 Text- und Regeldateien, bei der alten Grenze von 3000 blieben die übrigen ungeprüft.
+test('Stufe 1: /scan prüft auch die Text- und Regeldateien nach der 3000. (eigene Grenze 20000)', VERTRAUT, async ($, on) => {
+  mock.clock(on)
+  on('tool.call', () => toolAnswer as never)
+  const rlo = String.fromCharCode(0x202e)
+  const viele: Record<string, string> = {}
+  for (let i = 0; i < 3005; i++) viele[`D:\\sp\\n${String(i).padStart(4, '0')}.txt`] = 'nur Text\n'
+  viele['D:\\sp\\zuletzt.md'] = `Regel ${rlo}versteckt\n`
+  const d = scanPlatte(on, viele)
+  on('process.run', (_$, e) => {
+    const a = e.argv.map(String)
+    if (a[0] === 'cmd') return { value: { ...done, stdout: a.includes('%TEMP%') ? 'C:\\Temp\r\n' : '28.11.2026 01:00:00,00\r\n' } }
+    if (/gitleaks/i.test(a[0])) d[nachArg(a, '--report-path')] = '[]'
+    return { value: done }
+  })
+  await $.command.run({ command: 'scan', args: 'Probe' } as never)
+  // 3006 Dateien brauchen mehr als die 400 Runden, die scanResult wartet: weiter warten, bis das Ergebnis da ist (höchstens 40-mal)
+  let ergebnis = ''
+  for (let i = 0; i < 40 && !ergebnis.includes('Scan Probe'); i++) ergebnis = await scanResult($, 'Scan Probe')
+  expect(ergebnis).toContain('1 Fehler in 1 Dateien')
+  const bericht = d['C:\\Users\\probe\\Code-Waechter\\Fehlerberichte\\Probe_Fehlerbericht.txt'] ?? ''
+  expect(bericht).toContain('zuletzt.md')
+  expect(bericht).not.toContain('nicht auf unsichtbare Zeichen geprüft')
+})
+
+// Scan 28.11.2026: 37 Dateien ab 4,79 MB "Kopie nicht anlegbar" ($.fs.write lehnt über 4 MiB ab). Lehnt das Schreiben die Kopie ab,
+// kopiert der Wächter die Datei mit PowerShell (Pfade nur über Umgebungswerte) in den Spiegel; scheitert auch das, steht der Grund
+// einmal mit "Sicherheits-Scanner:" unter "Nicht geprüft".
+for (const fall of ['kopiert', 'kopie scheitert'] as const) {
+  test(`/scan: Datei, die write nicht schreiben kann, wird in den Spiegel kopiert (${fall})`, VERTRAUT, async ($, on) => {
+    mock.clock(on)
+    on('tool.call', () => toolAnswer as never)
+    // Über 4 MiB: nur dann kopiert der Wächter (5'000'010 Bytes)
+    const d: Record<string, string> = { 'C:\\Users\\probe\\Code-Waechter\\Projekte.txt': 'Probe | D:\\sp |\n', 'D:\\sp\\gross.json': `{"a": "${'a'.repeat(5_000_000)}"}\n` }
+    on('env.get', (_$, e) => ({ value: e.name === 'TEMP' ? 'C:\\Temp' : e.name === 'USERPROFILE' ? 'C:\\Users\\probe' : undefined }))
+    on('fs.write', (_$, e) => {
+      if (/\\spiegel-[^\\]+\\\d+\\gross\.json$/i.test(e.path)) return { deny: 'write over 4 MiB rejects' } as never
+      d[e.path] = String(e.text)
+      return { value: undefined }
+    })
+    on('fs.read', (_$, e) => (e.path in d ? { value: d[e.path] } : { deny: 'Datei nicht da' }) as never)
+    on('fs.list', (_$, e) => ({ value: e.path === 'D:\\sp' ? ['gross.json'].map(fileEntry) : [] }))
+    on('fs.exists', () => ({ value: true }))
+    const kopien: { argv: string[]; env: Record<string, unknown>; frist: unknown }[] = []
+    on('process.run', (_$, e) => {
+      const a = e.argv.map(String)
+      const init = ((e as { init?: { env?: Record<string, unknown>; timeoutMs?: unknown } }).init ?? {})
+      const env = (init.env ?? {}) as Record<string, unknown>
+      if (a[0] === 'cmd') return { value: { ...done, stdout: a.includes('%TEMP%') ? 'C:\\Temp\r\n' : '28.11.2026 01:00:00,00\r\n' } }
+      if (a.some(x => x.includes('Copy-Item'))) {
+        kopien.push({ argv: a, env, frist: init.timeoutMs })
+        if (fall === 'kopie scheitert') return { value: { ...done, exitCode: 1, stderr: 'Zugriff verweigert' } }
+        d[String(env.CW_NACH)] = d[String(env.CW_VON)] ?? ''
+      }
+      if (/gitleaks/i.test(a[0])) d[nachArg(a, '--report-path')] = '[]'
+      return { value: done }
+    })
+    await $.command.run({ command: 'scan', args: 'Probe' } as never)
+    expect(await scanResult($, 'Scan Probe')).toContain('Scan Probe')
+    const bericht = d['C:\\Users\\probe\\Code-Waechter\\Fehlerberichte\\Probe_Fehlerbericht.txt'] ?? ''
+    expect(kopien.length).toBe(1)
+    // PowerShell mit vollem Pfad aus dem Systemordner (sh löst den Namen auf), nie über den Suchpfad
+    expect(kopien[0]?.argv[0]).toBe('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+    expect(kopien[0]?.argv.slice(1, 4)).toEqual(['-NoProfile', '-NonInteractive', '-Command'])
+    expect(kopien[0]?.argv[4]).toContain('Copy-Item -LiteralPath $env:CW_VON -Destination $env:CW_NACH')
+    expect(kopien[0]?.argv.join(' ')).not.toContain('gross.json')
+    expect(kopien[0]?.env.CW_VON).toBe('D:\\sp\\gross.json')
+    expect(String(kopien[0]?.env.CW_NACH)).toMatch(/\\code-waechter\\spiegel-[\w-]+\\0\\gross\.json$/)
+    // Höchstens 120 s je Kopie und nie über die Zeitgrenze des Scans hinaus (eine ganze Zahl, wie $.process.run sie verlangt)
+    expect(Number.isInteger(kopien[0]?.frist) && Number(kopien[0]?.frist) >= 1 && Number(kopien[0]?.frist) <= 120000).toBe(true)
+    if (fall === 'kopiert') {
+      expect(bericht).not.toContain('Kopie nicht anlegbar')
+    } else {
+      // beide Gründe: der des Schreibens und der des Kopierens
+      expect(bericht).toContain('Sicherheits-Scanner: Kopie nicht anlegbar (')
+      expect(bericht).toContain('; Kopieren: Zugriff verweigert)')
+      expect(bericht).not.toContain('Sicherheits-Scanner: Sicherheits-Scanner:')
+    }
+  })
+}
+
+// 28.11.2026: nach /reload-plugins stand oben für immer "Scan <Projekt>" - der Eintrag der Laufanzeige liegt im
+// Sitzungszustand, der Scan war mit dem Neuladen weg. Beim Start und bei /waechter-leeren räumt der Wächter solche Reste weg.
+test('Neuladen: eine Laufanzeige, die ein abgebrochener Scan stehen liess, ist nach dem Start weg; /waechter-leeren räumt sie auch', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('fs.exists', () => ({ value: true }))
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.write', () => ({ value: undefined }))
+  on('process.run', () => ({ value: done }))
+  const rest = [{ id: 's7', file: 'Scan Spiele-Mods: Sicherheits-Scanner (5816 Dateien)', kind: 'Scan' }]
+  on('state.get', { plugin: 'code-waechter', key: 'running' } as never, (() => ({ value: { value: rest, version: 3 } })) as never)
+  const gesetzt: unknown[] = []
+  on('state.set', { plugin: 'code-waechter', key: 'running' } as never, ((_$: unknown, e: { value: unknown }) => {
+    gesetzt.push(e.value)
+    return { value: { isSet: true, version: 4 } }
+  }) as never)
+  await ($ as any).session.start({ cwd: 'D:\\t' })
+  expect(gesetzt).toEqual([[]])
+  const r = await $.command.run({ command: 'waechter-leeren', args: '' } as never)
+  expect(String(r.text)).toContain('Dazu 1 hängende Laufanzeige entfernt.')
+  expect(gesetzt).toEqual([[], []])
+})
+
+// Vierte Gegenprüfung 28.11.2026: session.start kommt auch bei /clear, während eine Prüfung läuft - deren Eintrag bleibt stehen.
+test('Neuladen: läuft gerade eine Prüfung, nehmen Start und /waechter-leeren ihren Eintrag nicht aus der Laufanzeige', VERTRAUT, async ($, on) => {
+  withTemp(on)
+  mock.clock(on)
+  on('fs.exists', () => ({ value: true }))
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('session.start', (_$, e) => e as never)
+  on('tool.call', () => toolAnswer as never)
+  on('fs.read', () => ({ value: 'foo()\n' }))
+  on('fs.write', () => ({ value: undefined }))
+  let release: () => void = () => undefined
+  const gate = new Promise<void>(r => {
+    release = r
+  })
+  let started: () => void = () => undefined
+  const running = new Promise<void>(r => {
+    started = r
+  })
+  on('process.run', async (_$, e) => {
+    const file = String((e.init?.env as Record<string, string> | undefined)?.CW_FILE ?? e.argv[e.argv.length - 1])
+    if (file.includes('eins')) {
+      started()
+      await gate
+    }
+    return { value: done }
+  })
+  const werte: unknown[][] = []
+  on('state.set', { plugin: 'code-waechter', key: 'running' } as never, ((_$: unknown, e: { value: unknown }, next: (x: unknown) => unknown) => {
+    werte.push(e.value as unknown[])
+    return next(e)
+  }) as never)
+  const first = $.tool.call({ tool: 'Write', file_path: 'D:\\t\\eins.py', content: 'x' })
+  await running
+  expect(werte.at(-1)?.length).toBe(1) // die laufende Prüfung steht in der Anzeige
+  const vorher = werte.length
+  await ($ as any).session.start({ cwd: 'D:\\t' })
+  const r = await $.command.run({ command: 'waechter-leeren', args: '' } as never)
+  expect(String(r.text)).not.toContain('hängende Laufanzeige')
+  expect(werte.slice(vorher).filter(w => w.length === 0)).toEqual([])
+  release()
+  await first
+  expect(werte.at(-1)).toEqual([]) // am Ende räumt die Prüfung ihren Eintrag selbst weg
+})
+
 test('Stufe 1: /scan nennt eine nicht lesbare Text- oder Regeldatei unter "Nicht geprüft", nie still', VERTRAUT, async ($, on) => {
   mock.clock(on)
   on('tool.call', () => toolAnswer as never)
